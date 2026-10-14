@@ -2,6 +2,8 @@
 
 A real-time monitoring engine for llama.cpp inference servers. Captures per-task performance metrics from a running `llama-server` instance, stores them in SQLite, and enables statistical analysis of model performance across different configurations and workloads.
 
+Vibe-coded with [Qwen3.8-35B-A3B-MTP @ Q5_K_M](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) on an [AMD Ryzen 5 5600GT](https://www.amd.com/en/support/downloads/drivers.html/processors/ryzen/ryzen-5000-series/amd-ryzen-5-5600gt.html#amd_support_product_spec).
+
 ## Overview
 
 `llama-mon` runs as a background daemon that periodically polls a llama.cpp server's `/models` and `/metrics` endpoints. It tracks:
@@ -14,13 +16,13 @@ A real-time monitoring engine for llama.cpp inference servers. Captures per-task
 
 ```
 ┌──────────────┐     /models + /metrics      ┌───────────────┐
-│  llama-server │ ──────────────────────────► │  llama-mon    │
-│              │                               │               │
-│  - Model     │                               │  Poll Engine  │──► SQLite DB
-│    Loads     │                               │  - Dedup      │
-│  - Slots     │                               │  - Parse      │
-│  - Tasks     │                               │  - Store      │
-└──────────────┘                               └───────────────┘
+│ llama-server │ ──────────────────────────► │  llama-mon    │
+│              │                             │               │
+│  - Model     │                             │  Poll Engine  │──► SQLite DB
+│    Loads     │                             │  - Dedup      │
+│  - Slots     │                             │  - Parse      │
+│  - Tasks     │                             │  - Store      │
+└──────────────┘                             └───────────────┘
 ```
 
 ### Components
