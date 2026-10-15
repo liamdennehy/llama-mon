@@ -3,26 +3,38 @@
 //! Converts the raw key=value block from llama-server's `status.preset`
 //! into a structured `PresetConfig`.
 
+/// All preset keys emitted by llama-server's `/models` endpoint.
+/// Keys are split into two groups: those llama-mon tracks in the DB
+/// and those it intentionally ignores (logging, file paths, etc.).
+const KNOWN_KEYS: &[&str] = &[
+    // Tracked — stored in model_loads preset columns
+    "batch-size", "ctx-size", "cache-type-k", "cache-type-v",
+    "n-gpu-layers", "parallel", "threads", "threads-batch", "ubatch-size",
+    "flash-attn", "kv-unified", "jinja", "cache-prompt",
+    // Ignored — known to exist but not relevant for performance analysis
+    "model", "log-verbosity", "log-colors", "log-file",
+];
+
 /// Parsed preset configuration from a llama-server model entry.
 #[derive(Debug, Default, Clone)]
 pub struct PresetConfig {
-    pub cache_prompt: Option<bool>,
-    pub jinja: Option<bool>,
-    pub log_colors: Option<bool>,
-    pub log_file: Option<String>,
     pub batch_size: Option<i64>,
     pub ctx_size: Option<i64>,
     pub cache_type_k: Option<String>,
     pub cache_type_v: Option<String>,
-    pub flash_attn: Option<bool>,
-    pub kv_unified: Option<bool>,
-    pub log_verbosity: Option<i64>,
-    pub model_path: Option<String>,
     pub n_gpu_layers: Option<i64>,
     pub parallel: Option<i64>,
     pub threads: Option<i64>,
     pub threads_batch: Option<i64>,
     pub ubatch_size: Option<i64>,
+    /// Boolean preset knobs that affect serving behavior.
+    pub flash_attn: Option<bool>,
+    pub kv_unified: Option<bool>,
+    pub jinja: Option<bool>,
+    pub cache_prompt: Option<bool>,
+    /// Keys emitted by the server that are not recognized by llama-mon
+    /// at all. Used to emit a one-per-session warning for audit.
+    pub unknown_keys: std::collections::BTreeSet<String>,
     /// Raw input string, preserved for audit/debug.
     pub raw: String,
 }
@@ -54,22 +66,26 @@ impl PresetConfig {
             match key {
                 "cache-prompt"     => config.cache_prompt     = parse_bool(value),
                 "jinja"            => config.jinja            = parse_bool(value),
-                "log-colors"       => config.log_colors       = parse_bool(value),
-                "log-file"         => config.log_file         = Some(value.to_string()),
                 "batch-size"       => config.batch_size       = value.parse().ok(),
                 "ctx-size"         => config.ctx_size         = value.parse().ok(),
                 "cache-type-k"     => config.cache_type_k     = Some(value.to_string()),
                 "cache-type-v"     => config.cache_type_v     = Some(value.to_string()),
                 "flash-attn"       => config.flash_attn       = parse_bool(value),
                 "kv-unified"       => config.kv_unified       = parse_bool(value),
-                "log-verbosity"    => config.log_verbosity    = value.parse().ok(),
-                "model"            => config.model_path       = Some(value.to_string()),
                 "n-gpu-layers"     => config.n_gpu_layers     = value.parse().ok(),
                 "parallel"         => config.parallel         = value.parse().ok(),
                 "threads"          => config.threads          = value.parse().ok(),
                 "threads-batch"    => config.threads_batch    = value.parse().ok(),
                 "ubatch-size"      => config.ubatch_size      = value.parse().ok(),
-                _ => (), // Ignore unknown keys
+                // Intentionally ignored — known keys not stored in DB
+                "model" | "log-verbosity" | "log-colors" | "log-file" => {},
+                // Truly unknown — not in KNOWN_KEYS at all
+                _ if KNOWN_KEYS.contains(&key) => {
+                    unreachable!("{} is in KNOWN_KEYS but not matched above", key);
+                }
+                _ => {
+                    config.unknown_keys.insert(key.to_string());
+                }
             }
         }
 
@@ -123,15 +139,22 @@ ubatch-size = 256"#;
         assert_eq!(config.batch_size, Some(1024));
         assert_eq!(config.cache_prompt, Some(true));
         assert_eq!(config.jinja, Some(true));
-        // "off" is not a recognized boolean value, so it stays None
-        assert_eq!(config.log_colors, None);
         assert_eq!(config.flash_attn, Some(true));
         assert_eq!(config.kv_unified, Some(true));
-        assert_eq!(config.log_verbosity, Some(2));
         assert_eq!(config.ubatch_size, Some(256));
-        assert_eq!(config.model_path, Some("./example-model-Q6_K.gguf".to_string()));
-        assert_eq!(config.log_file, Some("/var/log/llama-server/example-model.log".to_string()));
+        // Ignored keys are not stored
+        assert!(config.unknown_keys.is_empty());
         assert!(config.raw.contains("[example-model]"));
+    }
+
+    #[test]
+    fn test_unknown_keys_collected() {
+        let raw = "[test]\nfoo-bar = baz\nctx-size = 1024\nunknown-key = 42";
+        let config = PresetConfig::parse(raw);
+        assert_eq!(config.ctx_size, Some(1024));
+        assert_eq!(config.unknown_keys.len(), 2);
+        assert!(config.unknown_keys.contains("foo-bar"));
+        assert!(config.unknown_keys.contains("unknown-key"));
     }
 
     #[test]
@@ -154,7 +177,7 @@ ubatch-size = 256"#;
     #[test]
     fn test_parse_section_header_only() {
         let config = PresetConfig::parse("[my-model]");
-        assert_eq!(config.model_path, None);
+        assert!(config.unknown_keys.is_empty());
         assert_eq!(config.raw, "[my-model]");
     }
 }

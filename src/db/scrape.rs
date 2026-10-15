@@ -4,6 +4,18 @@ use sqlx::SqlitePool;
 
 use crate::db::DbError;
 
+/// The most recent scrape for a given model load.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ScrapeRow {
+    pub id: i64,
+    pub model_name: String,
+    pub model_created: i64,
+    pub model_load_id: i64,
+    pub scraped_at: i64,
+    pub tasks_completed: i64,
+    pub task_ids_seen: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScrapeInsert {
     pub model_name: String,
@@ -64,6 +76,41 @@ pub async fn insert(pool: &SqlitePool, s: &ScrapeInsert) -> Result<i64, DbError>
     .fetch_one(pool)
     .await?;
     Ok(id)
+}
+
+/// Get the most recent scrape for a given model load.
+/// Returns None if no scrapes exist.
+pub async fn get_latest_for_load(
+    pool: &SqlitePool,
+    model_load_id: i64,
+) -> Result<Option<ScrapeRow>, DbError> {
+    let row: Option<ScrapeRow> = sqlx::query_as(
+        r#"SELECT id, model_name, model_created, model_load_id, scraped_at,
+                tasks_completed, task_ids_seen
+           FROM scrapes
+           WHERE model_load_id = ?
+           ORDER BY scraped_at DESC LIMIT 1"#
+    )
+    .bind(model_load_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Get the most recent tasks_completed counter for reload detection.
+pub async fn get_latest_completed(
+    pool: &SqlitePool,
+    model_load_id: i64,
+) -> Result<Option<i64>, DbError> {
+    let val: Option<i64> = sqlx::query_scalar(
+        r#"SELECT tasks_completed FROM scrapes
+           WHERE model_load_id = ?
+           ORDER BY scraped_at DESC LIMIT 1"#
+    )
+    .bind(model_load_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(val)
 }
 
 /// Convert a sorted set of task IDs to a comma-separated string.
@@ -145,6 +192,35 @@ mod tests {
         };
         let id = insert(&pool, &scrape).await.unwrap();
         assert!(id > 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires database"]
+    async fn test_get_latest_for_load() {
+        let pool = test_pool().await;
+        let scrape = ScrapeInsert {
+            model_name: "test-latest".to_string(),
+            model_created: 1111111111,
+            model_load_id: 1,
+            scraped_at: 1111111120,
+            context_max: Some(16384),
+            tasks_processing: 0, tasks_queued: 0, tasks_completed: 10,
+            tasks_duration_s: 10.0,
+            prompt_tokens_total: Some(100), prompt_tokens_cached: Some(50),
+            prompt_tokens_processed: Some(50),
+            prediction_tokens_total: Some(50), prediction_tokens_processed: Some(50),
+            decode_total: Some(45), kvcache_active_tokens: Some(100),
+            memory_context_bytes: Some(1000000), memory_model_bytes: Some(2000000),
+            task_ids_seen: "1,2,3,4,5".to_string(),
+        };
+        let _id = insert(&pool, &scrape).await.unwrap();
+
+        let latest = get_latest_for_load(&pool, 1).await.unwrap().unwrap();
+        assert_eq!(latest.tasks_completed, 10);
+        assert_eq!(latest.task_ids_seen, "1,2,3,4,5");
+
+        let none = get_latest_for_load(&pool, 999).await.unwrap();
+        assert!(none.is_none());
     }
 
     async fn test_pool() -> SqlitePool {

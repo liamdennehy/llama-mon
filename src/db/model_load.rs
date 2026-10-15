@@ -4,7 +4,7 @@ use sqlx::SqlitePool;
 
 use crate::db::DbError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ModelLoadRow {
     pub id: i64,
     pub model_name: String,
@@ -22,12 +22,8 @@ pub struct ModelLoadRow {
     pub n_gpu_layers: Option<i64>,
     pub cache_type_k: Option<String>,
     pub cache_type_v: Option<String>,
-    pub model_path: Option<String>,
-    pub log_verbosity: Option<i64>,
     pub flash_attn: Option<i64>,
     pub kv_unified: Option<i64>,
-    pub jinja: Option<i64>,
-    pub cache_prompt: Option<i64>,
     pub context_bytes: Option<i64>,
     pub model_bytes: Option<i64>,
     pub scrape_count: i64,
@@ -48,12 +44,8 @@ pub struct ModelLoadInsert<'a> {
     pub n_gpu_layers: Option<i64>,
     pub cache_type_k: Option<&'a str>,
     pub cache_type_v: Option<&'a str>,
-    pub model_path: Option<&'a str>,
-    pub log_verbosity: Option<i64>,
     pub flash_attn: Option<i64>,
     pub kv_unified: Option<i64>,
-    pub jinja: Option<i64>,
-    pub cache_prompt: Option<i64>,
     pub context_bytes: Option<i64>,
     pub model_bytes: Option<i64>,
 }
@@ -76,8 +68,8 @@ pub async fn upsert(
             r#"UPDATE model_loads SET
                 status = ?, preset_raw = ?, ctx_size = ?, n_batch = ?, n_ubatch = ?,
                 parallel = ?, threads = ?, threads_batch = ?, n_gpu_layers = ?,
-                cache_type_k = ?, cache_type_v = ?, model_path = ?, log_verbosity = ?,
-                flash_attn = ?, kv_unified = ?, jinja = ?, cache_prompt = ?,
+                cache_type_k = ?, cache_type_v = ?,
+                flash_attn = ?, kv_unified = ?,
                 context_bytes = ?, model_bytes = ?
             WHERE id = ?"#
         )
@@ -92,12 +84,8 @@ pub async fn upsert(
         .bind(ml.n_gpu_layers)
         .bind(ml.cache_type_k)
         .bind(ml.cache_type_v)
-        .bind(ml.model_path)
-        .bind(ml.log_verbosity)
         .bind(ml.flash_attn)
         .bind(ml.kv_unified)
-        .bind(ml.jinja)
-        .bind(ml.cache_prompt)
         .bind(ml.context_bytes)
         .bind(ml.model_bytes)
         .bind(id)
@@ -109,10 +97,10 @@ pub async fn upsert(
             r#"INSERT INTO model_loads (
                 model_name, created, status, preset_raw, ctx_size, n_batch, n_ubatch,
                 parallel, threads, threads_batch, n_gpu_layers,
-                cache_type_k, cache_type_v, model_path, log_verbosity,
-                flash_attn, kv_unified, jinja, cache_prompt,
+                cache_type_k, cache_type_v,
+                flash_attn, kv_unified,
                 context_bytes, model_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id"#
         )
         .bind(ml.model_name)
@@ -128,12 +116,8 @@ pub async fn upsert(
         .bind(ml.n_gpu_layers)
         .bind(ml.cache_type_k)
         .bind(ml.cache_type_v)
-        .bind(ml.model_path)
-        .bind(ml.log_verbosity)
         .bind(ml.flash_attn)
         .bind(ml.kv_unified)
-        .bind(ml.jinja)
-        .bind(ml.cache_prompt)
         .bind(ml.context_bytes)
         .bind(ml.model_bytes)
         .fetch_one(pool)
@@ -205,6 +189,21 @@ pub async fn get_ids_by_name(pool: &SqlitePool, model_name: &str) -> Result<Vec<
     Ok(ids)
 }
 
+/// Fetch a single model_load row by id.
+pub async fn get_by_id(pool: &SqlitePool, id: i64) -> Result<Option<ModelLoadRow>, DbError> {
+    let row: Option<ModelLoadRow> = sqlx::query_as(
+        r#"SELECT id, model_name, created, status, loaded_at, unloaded_at,
+                preset_raw, ctx_size, n_batch, n_ubatch, parallel, threads,
+                threads_batch, n_gpu_layers, cache_type_k, cache_type_v,
+                flash_attn, kv_unified, context_bytes, model_bytes, scrape_count
+           FROM model_loads WHERE id = ?"#
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,12 +230,8 @@ mod tests {
             n_gpu_layers: Some(-1),
             cache_type_k: Some("f16"),
             cache_type_v: Some("f16"),
-            model_path: Some("./test.gguf"),
-            log_verbosity: Some(2),
             flash_attn: Some(1),
             kv_unified: Some(1),
-            jinja: Some(1),
-            cache_prompt: Some(1),
             context_bytes: Some(1000),
             model_bytes: Some(2000),
         };
@@ -262,18 +257,40 @@ mod tests {
             n_gpu_layers: None,
             cache_type_k: None,
             cache_type_v: None,
-            model_path: None,
-            log_verbosity: None,
             flash_attn: None,
             kv_unified: None,
-            jinja: None,
-            cache_prompt: None,
             context_bytes: None,
             model_bytes: None,
         };
         let id1 = upsert(&pool, &insert).await.unwrap();
         let id2 = upsert(&pool, &insert).await.unwrap();
         assert_eq!(id1, id2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires database"]
+    async fn test_get_by_id() {
+        let pool = test_pool().await;
+        let insert = ModelLoadInsert {
+            model_name: "test-get",
+            created: 7777777777,
+            status: "loaded",
+            preset_raw: Some("[get]"),
+            ctx_size: Some(4096),
+            n_batch: None, n_ubatch: None, parallel: None, threads: None,
+            threads_batch: None, n_gpu_layers: None, cache_type_k: None,
+            cache_type_v: None, flash_attn: None, kv_unified: None,
+            context_bytes: None, model_bytes: None,
+        };
+        let id = upsert(&pool, &insert).await.unwrap();
+
+        let row = get_by_id(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.id, id);
+        assert_eq!(row.model_name, "test-get");
+        assert_eq!(row.ctx_size, Some(4096));
+
+        let none = get_by_id(&pool, 9999).await.unwrap();
+        assert!(none.is_none());
     }
 
     async fn test_pool() -> SqlitePool {
