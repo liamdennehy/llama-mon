@@ -1095,6 +1095,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "dotenvy",
  "duration-str",
  "futures",
  "humantime",

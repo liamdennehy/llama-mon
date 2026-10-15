@@ -129,6 +129,26 @@ impl From<&TaskRecord> for TaskInsert {
     }
 }
 
+/// Sanitize a float value: clamp NaN and negative values to 0.0.
+fn sanitize_f64(v: f64) -> f64 {
+    if v.is_nan() || v < 0.0 {
+        tracing::warn!(value = v, "Invalid metric value — clamping to 0.0");
+        0.0
+    } else {
+        v
+    }
+}
+
+/// Sanitize an integer value: clamp negative values to 0.
+fn sanitize_i64(v: i64) -> i64 {
+    if v < 0 {
+        tracing::warn!(value = v, "Invalid metric value — clamping to 0");
+        0
+    } else {
+        v
+    }
+}
+
 /// Extract aggregate metrics into a database scrape insert struct.
 impl From<(&FullMetrics, i64)> for ScrapeInsert {
     fn from((metrics, captured_at): (&FullMetrics, i64)) -> Self {
@@ -138,10 +158,10 @@ impl From<(&FullMetrics, i64)> for ScrapeInsert {
             model_load_id: 0,           // set by caller
             scraped_at: captured_at,
             context_max: Some(metrics.context_max),
-            tasks_processing: metrics.tasks.processing,
-            tasks_queued: metrics.tasks.queued,
-            tasks_completed: metrics.tasks.completed,
-            tasks_duration_s: metrics.tasks.duration_seconds,
+            tasks_processing: sanitize_i64(metrics.tasks.processing),
+            tasks_queued: sanitize_i64(metrics.tasks.queued),
+            tasks_completed: sanitize_i64(metrics.tasks.completed),
+            tasks_duration_s: sanitize_f64(metrics.tasks.duration_seconds),
             prompt_tokens_total: Some(metrics.prompt.tokens_total),
             prompt_tokens_cached: Some(metrics.prompt.tokens_cached_total),
             prompt_tokens_processed: Some(metrics.prompt.tokens_processed),

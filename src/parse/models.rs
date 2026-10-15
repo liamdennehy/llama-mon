@@ -76,12 +76,22 @@ pub struct ModelLoad {
 
 impl ModelLoad {
     /// Convert a raw `ModelEntry` into a parsed `ModelLoad`.
+    ///
+    /// If the preset string is `None` or empty, returns a `PresetConfig` with
+    /// default values and logs a warning.
     pub fn from_entry(entry: &ModelEntry) -> Self {
+        let preset = match &entry.preset {
+            Some(raw) if !raw.trim().is_empty() => PresetConfig::parse(raw),
+            _ => {
+                tracing::warn!(model = entry.model, "Preset string missing or empty — using defaults");
+                PresetConfig::default()
+            }
+        };
         Self {
             model_name: entry.model.clone(),
             created: entry.created,
             status: entry.status.as_str().into(),
-            preset: entry.preset.as_deref().map(PresetConfig::parse).unwrap_or_default(),
+            preset,
         }
     }
 }

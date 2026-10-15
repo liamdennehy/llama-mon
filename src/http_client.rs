@@ -54,6 +54,11 @@ impl HttpClient {
         }
     }
 
+    /// Return the base URL of the configured server.
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+
     /// GET a JSON response from the server with retry and logging.
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, HttpError> {
         let mut url = self.base_url.clone();
@@ -79,6 +84,9 @@ impl HttpClient {
 
                     if status.is_success() {
                         let body = response.text().await?;
+                        // Log truncated raw body for verbose/debug mode
+                        let truncated = body.chars().take(256).collect::<String>();
+                        tracing::debug!(response = truncated, "Raw JSON response");
                         return Ok(serde_json::from_str(&body)?);
                     }
 

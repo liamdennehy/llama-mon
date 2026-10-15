@@ -70,3 +70,49 @@ pub async fn wal_checkpoint(pool: &SqlitePool) -> Result<i64, DbError> {
         .await?;
     Ok(result)
 }
+
+/// Execute a database operation with retry on transient errors (BUSY/LOCKED).
+///
+/// Retries up to `max_attempts` times, waiting `100ms * attempt` between retries.
+/// Logs a warning on each retry.
+pub async fn retry_with_backoff<F, T>(f: F, max_attempts: u32) -> Result<T, DbError>
+where
+    F: Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, DbError>> + Send>>,
+{
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempts >= max_attempts {
+                    return Err(e);
+                }
+                if e.is_transient() {
+                    tracing::warn!(
+                        attempt = attempts,
+                        max_attempts = max_attempts,
+                        "Transient DB error, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempts as u64)).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Check if a `DbError` represents a transient/busy condition.
+impl DbError {
+    /// Returns true if this error is transient (BUSY, LOCKED, etc.).
+    pub fn is_transient(&self) -> bool {
+        match self {
+            DbError::Sqlx(sqlx::Error::Database(e)) => {
+                e.code().map(|c| c == "5" || c == "6").unwrap_or(false)
+                // SQLite BUSY=5, LOCKED=6
+            }
+            _ => false,
+        }
+    }
+}

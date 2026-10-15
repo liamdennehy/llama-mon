@@ -12,10 +12,9 @@ mod parse;
 mod poller;
 mod preset;
 
-use poller::Poller;
+use poller::{Poller, SignalAction};
 
 use anyhow::Result;
-use clap::Parser;
 use futures::StreamExt;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -24,7 +23,8 @@ use crate::config::Config;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let mut config = Config::parse();
+    // Load .env file first (silently), then parse CLI args
+    let mut config = Config::load();
     config.resolve()?;
 
     // Initialize logging
@@ -44,47 +44,56 @@ async fn main() -> Result<()> {
 
     let server_url = config.resolve()?;
 
-    tracing::info!(
-        server_url = %server_url,
-        poll_interval = ?config.poll_duration(),
-        db_path = %config.db_path.display(),
-        "llama-mon starting"
-    );
-
     // Open database
     let pool = db::open_pool(&config.db_path).await?;
     db::schema::init_db(&pool).await?;
     tracing::info!("Database initialized");
 
-    // Set up shutdown signal (SIGINT + SIGTERM)
-    let mut signals =
-        signal_hook_tokio::Signals::new([signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM])?;
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
-
-    // Spawn a task that forwards signals to the broadcast channel
+    // Signal handler task — dispatches to channel
+    let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel::<SignalAction>();
+    let mut signals = signal_hook_tokio::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGUSR1,
+    ])?;
     tokio::spawn(async move {
-        while let Some(_sig) = signals.next().await {
-            let _ = shutdown_tx.send(());
+        while let Some(sig) = signals.next().await {
+            let action = match sig {
+                signal_hook::consts::SIGINT | signal_hook::consts::SIGTERM => SignalAction::Shutdown,
+                signal_hook::consts::SIGHUP => SignalAction::DumpConfig,
+                signal_hook::consts::SIGUSR1 => SignalAction::DumpStats,
+                _ => continue,
+            };
+            if action_tx.send(action).is_err() {
+                break; // main dropped receiver
+            }
         }
     });
 
     // Startup banner
     tracing::info!(
-        "Server: {}  Interval: {:?}  Timeout: {:?}  Verbose: {}",
-        server_url,
-        config.poll_duration(),
-        config.timeout_duration(),
-        config.verbose
+        server = %server_url,
+        poll_interval = ?config.poll_duration(),
+        timeout = ?config.timeout_duration(),
+        verbose = config.verbose,
+        model_filter = ?config.models,
+        "llama-mon starting"
     );
 
     // Create and run the poller
     let mut poller = Poller::new(config, pool);
-    if let Err(e) = poller.run(shutdown_rx).await {
-        tracing::error!(error = %e, "Poller stopped");
+    loop {
+        tokio::select! {
+            result = poller.run(action_rx) => {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "Poller stopped");
+                }
+                break;
+            }
+        }
     }
 
-    // Final stats
     tracing::info!("llama-mon shutting down");
-
     Ok(())
 }

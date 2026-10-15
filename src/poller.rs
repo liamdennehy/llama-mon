@@ -10,7 +10,7 @@
 //! 6. Persists tasks and scrapes to SQLite
 
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::config::Config;
 use crate::db;
@@ -20,6 +20,16 @@ use crate::http_client::HttpClient;
 use crate::metrics_api;
 use crate::models_api;
 use crate::parse::{ModelEntry, ModelLoad};
+
+/// Signal actions dispatched by the signal handler in `main.rs`.
+pub enum SignalAction {
+    /// SIGINT / SIGTERM — initiate graceful shutdown.
+    Shutdown,
+    /// SIGHUP — re-read and log configuration.
+    DumpConfig,
+    /// SIGUSR1 — dump current poll stats to log.
+    DumpStats,
+}
 
 #[derive(Error, Debug)]
 pub enum PollerError {
@@ -91,54 +101,86 @@ impl Poller {
     }
 
     /// Run the main polling loop. Returns on shutdown.
-    pub async fn run(&mut self, mut shutdown: broadcast::Receiver<()>) -> Result<(), PollerError> {
+    ///
+    /// Handles three signal types:
+    /// - Shutdown (SIGINT/SIGTERM) — stop the loop
+    /// - DumpConfig (SIGHUP) — re-log the current configuration
+    /// - DumpStats (SIGUSR1) — log cumulative poll stats
+    pub async fn run(&mut self, mut action_rx: UnboundedReceiver<SignalAction>) -> Result<(), PollerError> {
         tracing::info!(
             poll_interval = ?self.config.poll_duration(),
             "Poller started"
         );
 
         loop {
-            tokio::select! {
-                _ = shutdown.recv() => {
-                    tracing::info!("Shutdown signal received");
-                    break;
-                }
-                result = self.poll_cycle() => {
-                    match result {
-                        Ok(stats) => {
-                            self.stats = stats;
-                            tracing::debug!(
-                                scrapes = self.stats.total_scrapes,
-                                tasks = self.stats.total_tasks,
-                                loads = self.stats.total_model_loads,
-                                reloads = self.stats.total_reloads,
-                                "Poll cycle completed"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "Poll cycle failed");
+            let result = tokio::select! {
+                _ = action_rx.recv() => {
+                    // Handle pending signals before polling
+                    loop {
+                        match action_rx.try_recv() {
+                            Ok(action) => match action {
+                                SignalAction::Shutdown => {
+                                    tracing::info!("Shutdown signal received");
+                                    // Graceful shutdown
+                                    tracing::info!(
+                                        total_scrapes = self.stats.total_scrapes,
+                                        total_tasks = self.stats.total_tasks,
+                                        total_model_loads = self.stats.total_model_loads,
+                                        total_reloads = self.stats.total_reloads,
+                                        "Graceful shutdown"
+                                    );
+                                    if let Err(e) = db::wal_checkpoint(&self.pool).await {
+                                        tracing::warn!(error = %e, "Failed to checkpoint WAL on shutdown");
+                                    }
+                                    return Err(PollerError::Stopped);
+                                }
+                                SignalAction::DumpConfig => {
+                                    tracing::info!(
+                                        server_url = %self.client.base_url(),
+                                        poll_interval = ?self.config.poll_duration(),
+                                        timeout = ?self.config.timeout_duration(),
+                                        verbose = self.config.verbose,
+                                        model_filter = ?self.config.models,
+                                        "Configuration (SIGHUP)"
+                                    );
+                                }
+                                SignalAction::DumpStats => {
+                                    tracing::info!(
+                                        total_scrapes = self.stats.total_scrapes,
+                                        total_tasks = self.stats.total_tasks,
+                                        total_model_loads = self.stats.total_model_loads,
+                                        total_poll_cycles = self.stats.total_poll_cycles,
+                                        total_reloads = self.stats.total_reloads,
+                                        "Poll stats (SIGUSR1)"
+                                    );
+                                }
+                            },
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Error reading signal action");
+                                break;
+                            }
                         }
                     }
+                    continue;
+                }
+                result = self.poll_cycle() => result,
+            };
+
+            match result {
+                Ok(stats) => {
+                    self.stats = stats;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Poll cycle failed");
                 }
             }
 
             tokio::time::sleep(self.config.poll_duration()).await;
         }
 
-        // Graceful shutdown
-        tracing::info!(
-            total_scrapes = self.stats.total_scrapes,
-            total_tasks = self.stats.total_tasks,
-            total_model_loads = self.stats.total_model_loads,
-            total_reloads = self.stats.total_reloads,
-            "Graceful shutdown"
-        );
-
-        // WAL checkpoint on shutdown
-        if let Err(e) = db::wal_checkpoint(&self.pool).await {
-            tracing::warn!(error = %e, "Failed to checkpoint WAL on shutdown");
-        }
-
+        // Should not reach here, but handle gracefully
+        tracing::info!("Poller loop ended unexpectedly");
         Err(PollerError::Stopped)
     }
 
@@ -148,11 +190,34 @@ impl Poller {
     /// 2. For each loaded model, fetch `/metrics`
     /// 3. Detect reloads, deduplicate, persist
     async fn poll_cycle(&mut self) -> Result<PollStats, PollerError> {
+        let cycle_span = tracing::info_span!("poll_cycle");
+        let _enter = cycle_span.enter();
         let cycle_start = std::time::Instant::now();
 
         // Step 1: Fetch /models
-        let models_resp = models_api::fetch_models(&self.client).await?;
+        let models_resp = match models_api::fetch_models(&self.client).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                match &e {
+                    crate::http_client::HttpError::Status(code, _) if *code >= 400 && *code < 500 => {
+                        tracing::error!(status = code, error = %e, "/models returned 4xx — skipping this cycle");
+                    }
+                    crate::http_client::HttpError::Status(code, _) if *code >= 500 => {
+                        tracing::error!(status = code, error = %e, "/models returned 5xx — will retry next cycle");
+                    }
+                    _ => {
+                        tracing::error!(error = %e, "Failed to fetch /models");
+                    }
+                }
+                return Ok(self.stats.clone());
+            }
+        };
         self.seen_models.clear();
+
+        // Edge case: empty data[]
+        if models_resp.data.is_empty() {
+            tracing::warn!("/models returned empty data[] — no active models");
+        }
 
         let mut new_loads = 0u64;
         let mut active_models: Vec<(ModelLoad, ModelEntry)> = Vec::new();
@@ -160,6 +225,17 @@ impl Poller {
         for entry in &models_resp.data {
             self.seen_models.insert(entry.model.clone());
             let load = ModelLoad::from_entry(entry);
+
+            // Step 1b: Model filter — skip models not in the filter list
+            if self.config.has_model_filter() {
+                let filtered = self.config.models.iter().any(|m| {
+                    m.eq_ignore_ascii_case(&entry.model)
+                });
+                if !filtered {
+                    tracing::debug!(model = entry.model, "Skipped by model filter");
+                    continue;
+                }
+            }
 
             // Log preset unknown keys warning (once per model load)
             if !load.preset.unknown_keys.is_empty() {
@@ -212,7 +288,23 @@ impl Poller {
             let load_id = model_load::upsert(&self.pool, &load_insert).await?;
 
             // Fetch metrics for this model
-            let metrics_resp = metrics_api::fetch_metrics(&self.client, &entry.model).await?;
+            let metrics_resp = match metrics_api::fetch_metrics(&self.client, &entry.model).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    match &e {
+                        crate::http_client::HttpError::Status(code, _) if *code >= 400 && *code < 500 => {
+                            tracing::error!(model = entry.model, status = code, error = %e, "/metrics returned 4xx — skipping");
+                        }
+                        crate::http_client::HttpError::Status(code, _) if *code >= 500 => {
+                            tracing::error!(model = entry.model, status = code, error = %e, "/metrics returned 5xx — will retry next cycle");
+                        }
+                        _ => {
+                            tracing::error!(model = entry.model, error = %e, "Failed to fetch /metrics");
+                        }
+                    }
+                    continue;
+                }
+            };
 
             // Extract metrics from first active model entry
             let active_metrics = match metrics_resp.active.first() {
@@ -297,12 +389,22 @@ impl Poller {
         self.stats.total_poll_cycles += 1;
 
         let elapsed = cycle_start.elapsed();
+
+        // Verbose: log individual task records
+        if self.config.verbose && !active_models.is_empty() {
+            tracing::debug!(
+                model_count = active_models.len(),
+                "Verbose mode enabled — full cycle logging"
+            );
+        }
+
         tracing::info!(
             elapsed_ms = elapsed.as_millis(),
             new_tasks = total_new_tasks,
             scrapes = total_scrapes,
             new_loads = new_loads,
             unloaded = unloaded,
+            total_model_loads = self.stats.total_model_loads,
             "Poll cycle completed"
         );
 
@@ -371,6 +473,10 @@ impl Poller {
 
     /// Process metrics: deduplicate tasks, persist, record scrape.
     ///
+    /// Even if there are no new tasks, a scrape is still recorded when
+    /// `recent_tasks` is non-empty. If `recent_tasks` is empty, we still
+    /// record the scrape with zero aggregates for completeness.
+    ///
     /// Returns (new_tasks_inserted, scrape_id).
     async fn process_metrics(
         &self,
@@ -380,6 +486,16 @@ impl Poller {
         recent_tasks: &[crate::parse::TaskRecord],
         scrape_insert: &db::scrape::ScrapeInsert,
     ) -> Result<(u64, i64), PollerError> {
+        let has_recent = !recent_tasks.is_empty();
+
+        if !has_recent {
+            // Edge case: no recent tasks — still record a scrape for completeness
+            // but skip dedup and insert steps
+            let scrape_id = db::scrape::insert(&self.pool, scrape_insert).await?;
+            tracing::debug!(model = model_name, "No recent tasks — recorded empty scrape");
+            return Ok((0, scrape_id));
+        }
+
         // Step 3c: Get seen task IDs from last scrape
         let seen_ids = db::task::get_seen_task_ids(
             &self.pool, model_name, model_created,
@@ -391,7 +507,9 @@ impl Poller {
             .collect();
 
         if new_records.is_empty() {
-            return Ok((0, 0));
+            // All tasks are duplicates — still record scrape
+            let scrape_id = db::scrape::insert(&self.pool, scrape_insert).await?;
+            return Ok((0, scrape_id));
         }
 
         // Build TaskInsert rows
