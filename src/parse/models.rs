@@ -14,7 +14,7 @@ pub struct ModelsResponse {
 }
 
 /// A single model entry in the `data[]` array.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ModelEntry {
     pub model: String,
     pub created: i64,

@@ -12,13 +12,11 @@ mod parse;
 mod poller;
 mod preset;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
+use poller::Poller;
 
 use anyhow::Result;
 use clap::Parser;
 use futures::StreamExt;
-use signal_hook_tokio::Signals;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -59,8 +57,16 @@ async fn main() -> Result<()> {
     tracing::info!("Database initialized");
 
     // Set up shutdown signal (SIGINT + SIGTERM)
-    let mut shutdown = Signals::new([signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM])?;
-    let shutdown_flag = AtomicBool::new(false);
+    let mut signals =
+        signal_hook_tokio::Signals::new([signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM])?;
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+
+    // Spawn a task that forwards signals to the broadcast channel
+    tokio::spawn(async move {
+        while let Some(_sig) = signals.next().await {
+            let _ = shutdown_tx.send(());
+        }
+    });
 
     // Startup banner
     tracing::info!(
@@ -71,29 +77,14 @@ async fn main() -> Result<()> {
         config.verbose
     );
 
-    // Main loop — just initialize and report readiness
-    // Full polling logic will be implemented in Phase 4.
-    loop {
-        if shutdown_flag.load(Ordering::Relaxed) {
-            break;
-        }
-        tokio::select! {
-            _ = shutdown.next() => {
-                shutdown_flag.store(true, Ordering::Relaxed);
-            }
-            _ = tokio::time::sleep(config.poll_duration()) => {
-                // TODO: implement poll cycle
-            }
-        }
+    // Create and run the poller
+    let mut poller = Poller::new(config, pool);
+    if let Err(e) = poller.run(shutdown_rx).await {
+        tracing::error!(error = %e, "Poller stopped");
     }
 
-    // Graceful shutdown
+    // Final stats
     tracing::info!("llama-mon shutting down");
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("clock went backwards")
-        .as_secs();
-    tracing::info!(shutdown_time = now, "shutdown complete");
 
     Ok(())
 }
