@@ -40,7 +40,7 @@ pub async fn bulk_insert(
             n_prompt_cached, n_prompt_processed, prompt_ms, prompt_tps, prompt_per_token_ms,
             n_gen, gen_ms, gen_tps, gen_per_token_ms,
             n_draft_tokens, n_draft_accepted, captured_at
-        ) VALUES "
+        ) "
     );
 
     qb.push_values(tasks, |mut b, task| {

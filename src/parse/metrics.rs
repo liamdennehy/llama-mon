@@ -1,16 +1,44 @@
 //! Deserialization types for the `/metrics` endpoint response.
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::db::task::TaskInsert;
 use crate::db::scrape::ScrapeInsert;
+
+/// Deserialize `available`/`wait`/`error` which may be `Vec<String>` or
+/// `Vec<{model, status}>` depending on the llama-server version.
+fn deserialize_string_or_object_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Array(arr) => arr
+            .into_iter()
+            .map(|v| {
+                if let Some(s) = v.as_str() {
+                    Ok(s.to_string())
+                } else if let Some(obj) = v.as_object() {
+                    Ok(obj.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string())
+                } else {
+                    Ok(String::new())
+                }
+            })
+            .collect(),
+        _ => Ok(Vec::new()),
+    }
+}
 
 /// Top-level response from `/metrics?model=<name>`.
 #[derive(Debug, Deserialize)]
 pub struct MetricsResponse {
     pub active: Vec<ActiveModel>,
+    #[serde(default, deserialize_with = "deserialize_string_or_object_list")]
     pub available: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_object_list")]
     pub wait: Vec<String>,
+    #[serde(default)]
     pub error: Vec<String>,
 }
 
@@ -61,12 +89,41 @@ pub struct PredictionMetrics {
     pub tokens_processed: i64,
 }
 
+/// Accepted tokens from speculative decoding.
+#[derive(Debug, Default, Deserialize)]
+pub struct AcceptedTokens {
+    pub total: i64,
+    #[serde(default, alias = "draft_pos_0")]
+    pub draft_pos_0: i64,
+    #[serde(default, alias = "draft_pos_1")]
+    pub draft_pos_1: i64,
+    #[serde(default, alias = "draft_pos_2")]
+    pub draft_pos_2: i64,
+    #[serde(default, alias = "draft_pos_3")]
+    pub draft_pos_3: i64,
+    #[serde(default, alias = "draft_pos_4")]
+    pub draft_pos_4: i64,
+}
+
+/// Speculative decoding statistics.
+#[derive(Debug, Default, Deserialize)]
+pub struct SpeculativeMetrics {
+    #[serde(default)]
+    pub draft_tokens_total: i64,
+    #[serde(default)]
+    pub draft_steps_total: i64,
+    #[serde(default)]
+    pub accepted_tokens: AcceptedTokens,
+}
+
 /// Decode statistics.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct DecodeMetrics {
     pub total: i64,
     pub n_tokens_max: i64,
     pub n_busy_slots: i64,
+    #[serde(default)]
+    pub speculative: Option<SpeculativeMetrics>,
 }
 
 /// KV cache state.
@@ -89,14 +146,22 @@ pub struct MemoryMetrics {
 }
 
 /// A single completed task from `metrics.recent[]`.
-#[derive(Debug, Deserialize)]
+///
+/// Field names vary across llama-server versions; aliases cover the common forms.
+/// The live server uses `draft_accepted` (not `n_draft_accepted`).
+#[derive(Debug, Default, Deserialize)]
 pub struct TaskRecord {
     pub task_id: i64,
     pub slot: i64,
+    #[serde(alias = "prompt_cached")]
     pub n_prompt_cached: i64,
+    #[serde(alias = "prompt_new")]
     pub n_prompt_processed: i64,
+    #[serde(alias = "generated")]
     pub n_gen: i64,
+    #[serde(alias = "draft_tokens")]
     pub n_draft_tokens: i64,
+    #[serde(alias = "n_draft_accepted", default)]
     pub n_draft_accepted: i64,
     pub prompt_ms: f64,
     pub gen_ms: f64,
@@ -129,6 +194,26 @@ impl From<&TaskRecord> for TaskInsert {
     }
 }
 
+/// Sanitize a float value: clamp NaN and negative values to 0.0.
+fn sanitize_f64(v: f64) -> f64 {
+    if v.is_nan() || v < 0.0 {
+        tracing::warn!(value = v, "Invalid metric value — clamping to 0.0");
+        0.0
+    } else {
+        v
+    }
+}
+
+/// Sanitize an integer value: clamp negative values to 0.
+fn sanitize_i64(v: i64) -> i64 {
+    if v < 0 {
+        tracing::warn!(value = v, "Invalid metric value — clamping to 0");
+        0
+    } else {
+        v
+    }
+}
+
 /// Extract aggregate metrics into a database scrape insert struct.
 impl From<(&FullMetrics, i64)> for ScrapeInsert {
     fn from((metrics, captured_at): (&FullMetrics, i64)) -> Self {
@@ -138,10 +223,10 @@ impl From<(&FullMetrics, i64)> for ScrapeInsert {
             model_load_id: 0,           // set by caller
             scraped_at: captured_at,
             context_max: Some(metrics.context_max),
-            tasks_processing: metrics.tasks.processing,
-            tasks_queued: metrics.tasks.queued,
-            tasks_completed: metrics.tasks.completed,
-            tasks_duration_s: metrics.tasks.duration_seconds,
+            tasks_processing: sanitize_i64(metrics.tasks.processing),
+            tasks_queued: sanitize_i64(metrics.tasks.queued),
+            tasks_completed: sanitize_i64(metrics.tasks.completed),
+            tasks_duration_s: sanitize_f64(metrics.tasks.duration_seconds),
             prompt_tokens_total: Some(metrics.prompt.tokens_total),
             prompt_tokens_cached: Some(metrics.prompt.tokens_cached_total),
             prompt_tokens_processed: Some(metrics.prompt.tokens_processed),

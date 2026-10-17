@@ -1,25 +1,94 @@
 //! Deserialization types for the `/models` endpoint response.
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::preset::PresetConfig;
 
 /// Top-level response from `/models`.
+///
+/// Some llama-server versions only return `data` and `object` fields;
+/// the others are optional.
 #[derive(Debug, Deserialize)]
 pub struct ModelsResponse {
     pub data: Vec<ModelEntry>,
+    #[serde(default)]
     pub available: Vec<String>,
+    #[serde(default)]
     pub wait: Vec<String>,
+    #[serde(default)]
     pub error: Vec<String>,
 }
 
+/// A model status — can be either a string or a map with `value`, `args`,
+/// and optionally `preset`.
+///
+/// Newer llama.cpp versions return:
+/// ```json
+/// {"value": "loaded", "args": ["--cache-prompt", "--host", ...]}
+/// ```
+/// Newer versions also include `preset`:
+/// ```json
+/// {"value": "loaded", "preset": "[section]\nctx-size = 16384"}
+/// ```
+/// Older versions return just `"loaded"`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelStatus {
+    pub value: String,
+    pub args: Option<Vec<String>>,
+    pub preset: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ModelStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(s) => Ok(ModelStatus {
+                value: s,
+                args: None,
+                preset: None,
+            }),
+            Value::Object(map) => {
+                let val = map.get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let args = map.get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
+                let preset = map.get("preset")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                Ok(ModelStatus { value: val, args, preset })
+            }
+            _ => Ok(ModelStatus {
+                value: "unknown".to_string(),
+                args: None,
+                preset: None,
+            }),
+        }
+    }
+}
+
 /// A single model entry in the `data[]` array.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ModelEntry {
+    /// Model identifier (also accepted as `id` from some llama-server versions).
+    #[serde(alias = "id")]
     pub model: String,
     pub created: i64,
-    pub status: String,
-    #[serde(default, rename = "status_preset")]
+    /// Status can be a map or string; deserialized to `ModelStatus`.
+    pub status: ModelStatus,
+    /// Preset may appear as `status_preset` (older API), embedded in the
+    /// status map under `status.preset`, or at the top level.
+    #[serde(default, alias = "status_preset")]
     pub preset: Option<String>,
 }
 
@@ -76,12 +145,42 @@ pub struct ModelLoad {
 
 impl ModelLoad {
     /// Convert a raw `ModelEntry` into a parsed `ModelLoad`.
+    ///
+    /// If the preset string is `None` or empty, returns a `PresetConfig` with
+    /// default values and logs a warning.
     pub fn from_entry(entry: &ModelEntry) -> Self {
+        let preset = match &entry.preset {
+            Some(raw) if !raw.trim().is_empty() => PresetConfig::parse(raw),
+            None => {
+                // Check status.preset (newer API nests preset there)
+                entry.status.preset.as_deref()
+                    .filter(|raw| !raw.trim().is_empty())
+                    .map_or_else(
+                        || {
+                            tracing::warn!(model = entry.model, "Preset string missing or empty — using defaults");
+                            PresetConfig::default()
+                        },
+                        PresetConfig::parse,
+                    )
+            }
+            Some(raw) if raw.trim().is_empty() => {
+                entry.status.preset.as_deref()
+                    .filter(|raw| !raw.trim().is_empty())
+                    .map_or_else(
+                        || {
+                            tracing::warn!(model = entry.model, "Preset string missing or empty — using defaults");
+                            PresetConfig::default()
+                        },
+                        PresetConfig::parse,
+                    )
+            }
+            Some(_) => PresetConfig::default(),
+        };
         Self {
             model_name: entry.model.clone(),
             created: entry.created,
-            status: entry.status.as_str().into(),
-            preset: entry.preset.as_deref().map(PresetConfig::parse).unwrap_or_default(),
+            status: entry.status.value.as_str().into(),
+            preset,
         }
     }
 }
@@ -126,7 +225,11 @@ mod tests {
         let entry = ModelEntry {
             model: "test-model".to_string(),
             created: 1234567890,
-            status: "loaded".to_string(),
+            status: ModelStatus {
+                value: "loaded".to_string(),
+                args: None,
+                preset: None,
+            },
             preset: Some("[test]\nctx-size = 8192\nthreads = 4".to_string()),
         };
         let ml = ModelLoad::from_entry(&entry);
@@ -142,11 +245,42 @@ mod tests {
         let entry = ModelEntry {
             model: "test-model".to_string(),
             created: 1234567890,
-            status: "loaded".to_string(),
+            status: ModelStatus {
+                value: "loaded".to_string(),
+                args: None,
+                preset: None,
+            },
             preset: None,
         };
         let ml = ModelLoad::from_entry(&entry);
         assert_eq!(ml.preset.ctx_size, None);
         assert_eq!(ml.preset.raw, "");
+    }
+
+    #[test]
+    fn test_status_deserialize_map() {
+        let json = r#"{"value":"loaded","args":["--host","0.0.0.0","--port","8080"]}"#;
+        let status: ModelStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(status.value, "loaded");
+        assert_eq!(status.args, Some(vec!["--host".to_string(), "0.0.0.0".to_string(), "--port".to_string(), "8080".to_string()]));
+        assert!(status.preset.is_none());
+    }
+
+    #[test]
+    fn test_status_deserialize_string() {
+        let json = r#""loaded""#;
+        let status: ModelStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(status.value, "loaded");
+        assert!(status.args.is_none());
+    }
+
+    #[test]
+    fn test_model_entry_deserialize_map_status() {
+        let json = r#"{"model":"test","created":123,"status":{"value":"loaded","args":["--cache-prompt"]},"preset":"[test]\nctx-size=4096"}"#;
+        let entry: ModelEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.model, "test");
+        assert_eq!(entry.created, 123);
+        assert_eq!(entry.status.value, "loaded");
+        assert!(entry.preset.is_some());
     }
 }

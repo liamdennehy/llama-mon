@@ -100,7 +100,7 @@ pub async fn upsert(
                 cache_type_k, cache_type_v,
                 flash_attn, kv_unified,
                 context_bytes, model_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id"#
         )
         .bind(ml.model_name)

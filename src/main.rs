@@ -3,30 +3,15 @@
 //! Polls a llama-server's `/models` and `/metrics` endpoints and stores
 //! per-task performance data in SQLite for statistical analysis.
 
-mod config;
-mod db;
-mod http_client;
-mod metrics_api;
-mod models_api;
-mod parse;
-mod poller;
-mod preset;
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
-
 use anyhow::Result;
-use clap::Parser;
 use futures::StreamExt;
-use signal_hook_tokio::Signals;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::config::Config;
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let mut config = Config::parse();
+    // Load .env file first (silently), then parse CLI args
+    let mut config = llama_mon::config::Config::load();
     config.resolve()?;
 
     // Initialize logging
@@ -44,56 +29,59 @@ async fn main() -> Result<()> {
         .with(fmt_layer)
         .init();
 
-    let server_url = config.resolve()?;
-
-    tracing::info!(
-        server_url = %server_url,
-        poll_interval = ?config.poll_duration(),
-        db_path = %config.db_path.display(),
-        "llama-mon starting"
-    );
+    let server_url = config.resolved_url().expect("config not resolved");
 
     // Open database
-    let pool = db::open_pool(&config.db_path).await?;
-    db::schema::init_db(&pool).await?;
+    let pool = llama_mon::db::open_pool(&config.db_path).await?;
+    llama_mon::db::schema::init_db(&pool).await?;
     tracing::info!("Database initialized");
 
-    // Set up shutdown signal (SIGINT + SIGTERM)
-    let mut shutdown = Signals::new([signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM])?;
-    let shutdown_flag = AtomicBool::new(false);
+    // Signal handler task — dispatches to channel
+    let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel::<llama_mon::poller::SignalAction>();
+    let mut signals = signal_hook_tokio::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGUSR1,
+    ])?;
+    tokio::spawn(async move {
+        while let Some(sig) = signals.next().await {
+            let action = match sig {
+                signal_hook::consts::SIGINT | signal_hook::consts::SIGTERM => llama_mon::poller::SignalAction::Shutdown,
+                signal_hook::consts::SIGHUP => llama_mon::poller::SignalAction::DumpConfig,
+                signal_hook::consts::SIGUSR1 => llama_mon::poller::SignalAction::DumpStats,
+                _ => continue,
+            };
+            if action_tx.send(action).is_err() {
+                break; // main dropped receiver
+            }
+        }
+    });
 
     // Startup banner
     tracing::info!(
-        "Server: {}  Interval: {:?}  Timeout: {:?}  Verbose: {}",
-        server_url,
-        config.poll_duration(),
-        config.timeout_duration(),
-        config.verbose
+        server = %server_url,
+        poll_interval = ?config.poll_duration(),
+        timeout = ?config.timeout_duration(),
+        verbose = config.verbose,
+        model_filter = ?config.models,
+        fail_fast = config.fail_fast,
+        "llama-mon starting"
     );
 
-    // Main loop — just initialize and report readiness
-    // Full polling logic will be implemented in Phase 4.
+    // Create and run the poller
+    let mut poller = llama_mon::poller::Poller::new(config, pool);
     loop {
-        if shutdown_flag.load(Ordering::Relaxed) {
-            break;
-        }
         tokio::select! {
-            _ = shutdown.next() => {
-                shutdown_flag.store(true, Ordering::Relaxed);
-            }
-            _ = tokio::time::sleep(config.poll_duration()) => {
-                // TODO: implement poll cycle
+            result = poller.run(action_rx) => {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "Poller stopped");
+                }
+                break;
             }
         }
     }
 
-    // Graceful shutdown
     tracing::info!("llama-mon shutting down");
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("clock went backwards")
-        .as_secs();
-    tracing::info!(shutdown_time = now, "shutdown complete");
-
     Ok(())
 }
