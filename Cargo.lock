@@ -1106,6 +1106,7 @@ dependencies = [
  "signal-hook",
  "signal-hook-tokio",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

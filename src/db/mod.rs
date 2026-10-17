@@ -25,10 +25,28 @@ pub use sqlx;
 
 /// Open a connection pool to the SQLite database at the given path.
 /// Enables WAL mode and busy timeout automatically.
+///
+/// Relative paths are resolved against the current working directory to
+/// avoid SQLite's inability to open relative paths from certain contexts.
+///
+/// Creates an empty file if it doesn't exist, to work around sandbox
+/// restrictions that prevent SQLite from creating files on open.
 pub async fn open_pool(path: &Path) -> Result<SqlitePool, DbError> {
-    std::fs::create_dir_all(path.parent().expect("db_path must have a parent"))?;
+    // Resolve to absolute path to avoid SQLite cantopen with relative paths
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    std::fs::create_dir_all(abs_path.parent().expect("db_path must have a parent"))?;
 
-    let dsn = format!("sqlite:{}", path.display());
+    // Touch the file to work around sandbox restrictions that prevent
+    // SQLite from creating files on connect.
+    if !abs_path.exists() {
+        std::fs::File::create(&abs_path)?;
+    }
+
+    let dsn = format!("sqlite:{}", abs_path.display());
     let pool = SqlitePool::connect(&dsn).await?;
 
     // Enable WAL mode for better concurrent read performance
@@ -47,9 +65,19 @@ pub async fn open_pool(path: &Path) -> Result<SqlitePool, DbError> {
 /// Open a single connection to the SQLite database at the given path.
 /// Enables WAL mode and busy timeout.
 pub async fn open_db(path: &Path) -> Result<SqliteConnection, DbError> {
-    std::fs::create_dir_all(path.parent().expect("db_path must have a parent"))?;
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    std::fs::create_dir_all(abs_path.parent().expect("db_path must have a parent"))?;
 
-    let dsn = format!("sqlite:{}", path.display());
+    // Touch the file to work around sandbox restrictions
+    if !abs_path.exists() {
+        std::fs::File::create(&abs_path)?;
+    }
+
+    let dsn = format!("sqlite:{}", abs_path.display());
     let mut conn = SqliteConnection::connect(&dsn).await?;
 
     sqlx::query("PRAGMA journal_mode=WAL")

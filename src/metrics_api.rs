@@ -1,25 +1,24 @@
 //! `/metrics` API wrapper.
 //!
-//! Fetches and logs per-model metrics from llama-server.
+//! Fetches and logs aggregated metrics from llama-server's `/metrics` endpoint.
+//! The live server requires `model=all` for aggregated metrics across all models.
 
 use crate::http_client::HttpClient;
 use crate::parse::MetricsResponse;
 
-/// Fetch metrics for a specific model from llama-server's `/metrics` endpoint.
+/// Fetch aggregated metrics from llama-server's `/metrics` endpoint.
 ///
-/// Logs the model name, number of active models, and number of recent tasks.
+/// Logs the number of active models, available models, and total recent tasks.
 pub async fn fetch_metrics(
     client: &HttpClient,
-    model_name: &str,
 ) -> Result<MetricsResponse, crate::http_client::HttpError> {
-    let resp = client.fetch_metrics(model_name).await?;
+    let resp = client.fetch_metrics().await?;
 
     let total_recent: usize = resp.active.iter()
         .map(|m| m.metrics.recent.len())
         .sum();
 
     tracing::info!(
-        model = model_name,
         active_models = resp.active.len(),
         available = resp.available.len(),
         waiting = resp.wait.len(),

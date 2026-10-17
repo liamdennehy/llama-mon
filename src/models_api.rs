@@ -8,11 +8,15 @@ use crate::parse::ModelsResponse;
 /// Fetch the list of models from llama-server's `/models` endpoint.
 ///
 /// Logs the number of loaded models and their statuses.
-pub async fn fetch_models(client: &HttpClient) -> Result<ModelsResponse, crate::http_client::HttpError> {
+/// No query parameters are sent — the `/models` endpoint does not accept
+/// a `?model=` parameter. Model filtering is done client-side.
+pub async fn fetch_models(
+    client: &HttpClient,
+) -> Result<ModelsResponse, crate::http_client::HttpError> {
     let resp = client.fetch_models().await?;
 
     let loaded: Vec<&str> = resp.data.iter()
-        .filter(|m| m.status == "loaded")
+        .filter(|m| m.status.value == "loaded")
         .map(|m| m.model.as_str())
         .collect();
 

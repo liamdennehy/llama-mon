@@ -86,9 +86,9 @@ pub struct Poller {
 
 impl Poller {
     /// Create a new poller.
-    pub fn new(mut config: Config, pool: sqlx::SqlitePool) -> Self {
+    pub fn new(config: Config, pool: sqlx::SqlitePool) -> Self {
         let client = HttpClient::new(
-            config.resolve().expect("invalid server URL"),
+            config.resolved_url().expect("config not resolved — call resolve() before creating poller").clone(),
             config.timeout_duration(),
         );
         Self {
@@ -98,6 +98,11 @@ impl Poller {
             stats: PollStats::default(),
             seen_models: std::collections::HashSet::new(),
         }
+    }
+
+    /// Return a reference to the database pool (for testing).
+    pub fn pool(&self) -> &sqlx::SqlitePool {
+        &self.pool
     }
 
     /// Run the main polling loop. Returns on shutdown.
@@ -141,6 +146,7 @@ impl Poller {
                                         timeout = ?self.config.timeout_duration(),
                                         verbose = self.config.verbose,
                                         model_filter = ?self.config.models,
+                                        fail_fast = self.config.fail_fast,
                                         "Configuration (SIGHUP)"
                                     );
                                 }
@@ -173,6 +179,14 @@ impl Poller {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Poll cycle failed");
+                    // If --fail-fast is set, exit immediately instead of retrying
+                    if self.config.fail_fast {
+                        tracing::warn!("Fail-fast mode — exiting after error");
+                        if let Err(wal_err) = db::wal_checkpoint(&self.pool).await {
+                            tracing::warn!(error = %wal_err, "Failed to checkpoint WAL on exit");
+                        }
+                        return Err(PollerError::Stopped);
+                    }
                 }
             }
 
@@ -182,6 +196,40 @@ impl Poller {
         // Should not reach here, but handle gracefully
         tracing::info!("Poller loop ended unexpectedly");
         Err(PollerError::Stopped)
+    }
+
+    /// Run the poller for exactly `max_cycles` cycles, then return stats.
+    ///
+    /// This is a test-friendly variant of `run()` that does not require
+    /// signal handling. It runs a fixed number of cycles and then exits
+    /// cleanly with `PollStats`.
+    /// Run the poller for exactly `max_cycles` cycles, then return stats.
+    ///
+    /// This is a test-friendly variant of `run()` that does not require
+    /// signal handling. It runs a fixed number of cycles and then exits
+    /// cleanly with `PollStats`.
+    pub async fn run_until(
+        &mut self,
+        max_cycles: u64,
+    ) -> Result<PollStats, PollerError> {
+        tracing::info!(max_cycles, "Poller started (test mode)");
+        let mut cycle = 0u64;
+        while cycle < max_cycles {
+            cycle += 1;
+            let stats = self.poll_cycle().await?;
+            self.stats = stats;
+            // Don't sleep after the last cycle
+            if cycle < max_cycles {
+                tokio::time::sleep(self.config.poll_duration()).await;
+            }
+        }
+        tracing::info!(
+            total_cycles = cycle,
+            total_scrapes = self.stats.total_scrapes,
+            total_tasks = self.stats.total_tasks,
+            "Poller finished (test mode)"
+        );
+        Ok(self.stats.clone())
     }
 
     /// Execute a single poll cycle.
@@ -195,21 +243,25 @@ impl Poller {
         let cycle_start = std::time::Instant::now();
 
         // Step 1: Fetch /models
+        // When no specific models are requested, send ?model=all to ensure
+        // the server always receives an explicit model specification.
         let models_resp = match models_api::fetch_models(&self.client).await {
             Ok(resp) => resp,
             Err(e) => {
                 match &e {
                     crate::http_client::HttpError::Status(code, _) if *code >= 400 && *code < 500 => {
                         tracing::error!(status = code, error = %e, "/models returned 4xx — skipping this cycle");
+                        return Ok(self.stats.clone());
                     }
                     crate::http_client::HttpError::Status(code, _) if *code >= 500 => {
                         tracing::error!(status = code, error = %e, "/models returned 5xx — will retry next cycle");
+                        return Ok(self.stats.clone());
                     }
                     _ => {
                         tracing::error!(error = %e, "Failed to fetch /models");
+                        return Err(PollerError::Http(e));
                     }
                 }
-                return Ok(self.stats.clone());
             }
         };
         self.seen_models.clear();
@@ -226,15 +278,10 @@ impl Poller {
             self.seen_models.insert(entry.model.clone());
             let load = ModelLoad::from_entry(entry);
 
-            // Step 1b: Model filter — skip models not in the filter list
-            if self.config.has_model_filter() {
-                let filtered = self.config.models.iter().any(|m| {
-                    m.eq_ignore_ascii_case(&entry.model)
-                });
-                if !filtered {
-                    tracing::debug!(model = entry.model, "Skipped by model filter");
-                    continue;
-                }
+            // Step 1b: Model filter — skip models not matching the filter
+            if !self.config.model_matches(&entry.model) {
+                tracing::debug!(model = entry.model, "Skipped by model filter");
+                continue;
             }
 
             // Log preset unknown keys warning (once per model load)
@@ -279,97 +326,192 @@ impl Poller {
         // Step 4: Lifecycle transitions — unload DB-only models
         let unloaded = self.check_lifecycle_transitions().await?;
 
-        // Step 5: Fetch metrics and persist for each active model
+        // Step 5: Fetch metrics (aggregated) and persist for each active model
         let mut total_new_tasks = 0u64;
         let mut total_scrapes = 0u64;
 
+        // Fetch aggregated metrics once
+        let metrics_resp: Option<crate::parse::MetricsResponse> = match metrics_api::fetch_metrics(&self.client).await {
+            Ok(resp) => {
+                tracing::debug!(active_count = resp.active.len(), "Metrics fetched successfully");
+                Some(resp)
+            },
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to fetch /metrics");
+                None
+            }
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock went backwards")
+            .as_secs() as i64;
+
+        // Collect active model names from metrics response
+        let metrics_model_names: Vec<String> = metrics_resp.as_ref()
+            .map(|r| r.active.iter().map(|m| m.model.clone()).collect())
+            .unwrap_or_default();
+
+        // Build a set of model names already processed from /models data
+        let mut processed_from_models: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (load, entry) in &active_models {
+            processed_from_models.insert(entry.model.clone());
+
             let load_insert = model_load_to_insert(load, entry);
             let load_id = model_load::upsert(&self.pool, &load_insert).await?;
 
-            // Fetch metrics for this model
-            let metrics_resp = match metrics_api::fetch_metrics(&self.client, &entry.model).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    match &e {
-                        crate::http_client::HttpError::Status(code, _) if *code >= 400 && *code < 500 => {
-                            tracing::error!(model = entry.model, status = code, error = %e, "/metrics returned 4xx — skipping");
-                        }
-                        crate::http_client::HttpError::Status(code, _) if *code >= 500 => {
-                            tracing::error!(model = entry.model, status = code, error = %e, "/metrics returned 5xx — will retry next cycle");
-                        }
-                        _ => {
-                            tracing::error!(model = entry.model, error = %e, "Failed to fetch /metrics");
-                        }
+            // Find the matching active model in the metrics response
+            let active_metrics = metrics_resp.as_ref()
+                .and_then(|r| r.active.iter().find(|m| m.model == entry.model));
+
+            tracing::debug!(
+                model = entry.model,
+                has_active = active_metrics.is_some(),
+                metrics_active_count = metrics_resp.as_ref().map(|r| r.active.len()).unwrap_or(0),
+                "Looking for model in metrics response"
+            );
+
+            if let Some(active) = active_metrics {
+                let full_metrics = &active.metrics;
+
+                tracing::debug!(
+                    model = entry.model,
+                    task_count = full_metrics.recent.len(),
+                    "Processing metrics for active model"
+                );
+
+                // Reload detection
+                let reload_event = self.detect_reload(&entry.model, entry.created, full_metrics.tasks.completed).await?;
+
+                match reload_event {
+                    ReloadEvent::ReloadDetected { .. } => {
+                        let old_id = load_id;
+                        model_load::close(&self.pool, old_id, now).await?;
+                        tracing::info!(
+                            model = entry.model,
+                            previous_completed = match reload_event {
+                                ReloadEvent::ReloadDetected { previous_completed, .. } => previous_completed,
+                                _ => 0,
+                            },
+                            "Model reload detected — closed old session"
+                        );
+
+                        let new_created = entry.created + 1;
+                        let new_load_id = model_load::upsert(&self.pool, &model_load_to_insert(&load, entry)).await?;
+
+                        let mut scrape_insert: db::scrape::ScrapeInsert =
+                            (full_metrics, now).into();
+                        scrape_insert.model_name = entry.model.clone();
+                        scrape_insert.model_created = new_created;
+                        scrape_insert.model_load_id = new_load_id;
+
+                        let (new_tasks, scrape_id) = self.process_metrics(
+                            &entry.model, new_created, new_load_id,
+                            &full_metrics.recent, &scrape_insert,
+                        ).await?;
+                        total_new_tasks += new_tasks;
+                        total_scrapes += if scrape_id > 0 { 1 } else { 0 };
                     }
-                    continue;
+                    ReloadEvent::FirstScrape | ReloadEvent::SameSession { .. } => {
+                        let mut scrape_insert: db::scrape::ScrapeInsert =
+                            (full_metrics, now).into();
+                        scrape_insert.model_name = entry.model.clone();
+                        scrape_insert.model_created = entry.created;
+                        scrape_insert.model_load_id = load_id;
+
+                        let (new_tasks, scrape_id) = self.process_metrics(
+                            &entry.model, entry.created, load_id,
+                            &full_metrics.recent, &scrape_insert,
+                        ).await?;
+                        total_new_tasks += new_tasks;
+                        total_scrapes += if scrape_id > 0 { 1 } else { 0 };
+                    }
                 }
-            };
+            }
+        }
 
-            // Extract metrics from first active model entry
-            let active_metrics = match metrics_resp.active.first() {
-                Some(m) => m,
-                None => {
-                    tracing::warn!(model = entry.model, "No active model in /metrics response");
-                    continue;
-                }
-            };
-
-            let full_metrics = &active_metrics.metrics;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock went backwards")
-                .as_secs() as i64;
-
-            // Reload detection
-            let reload_event = self.detect_reload(&entry.model, entry.created, full_metrics.tasks.completed).await?;
-
-            match reload_event {
-                ReloadEvent::ReloadDetected { .. } => {
-                    // Close the old model load and create a new one
-                    let old_id = load_id;
-                    model_load::close(&self.pool, old_id, now).await?;
+        // Also process models from metrics response that weren't in /models data
+        // (some llama-server versions report active models only in /metrics)
+        if let Some(ref resp) = metrics_resp {
+            for active in &resp.active {
+                if !processed_from_models.contains(&active.model) {
+                    // This model is active but not in /models data — create a minimal load entry
                     tracing::info!(
-                        model = entry.model,
-                        previous_completed = match reload_event {
-                            ReloadEvent::ReloadDetected { previous_completed, .. } => previous_completed,
-                            _ => 0,
-                        },
-                        "Model reload detected — closed old session"
+                        model = active.model,
+                        "Model found in /metrics but not in /models — creating load entry"
                     );
 
-                    // Create new model load
-                    let new_created = entry.created + 1;
-                    let new_load_insert = model_load_to_insert(&load, entry);
-                    let new_load_id = model_load::upsert(&self.pool, &new_load_insert).await?;
+                    // Upsert model load (use created=0 since we don't have it from /models)
+                    let min_load = crate::parse::ModelLoad {
+                        model_name: active.model.clone(),
+                        created: 0,
+                        status: crate::parse::ModelLoadStatus::Loaded,
+                        preset: Default::default(),
+                    };
+                    let min_entry = crate::parse::ModelEntry {
+                        model: active.model.clone(),
+                        created: 0,
+                        status: crate::parse::ModelStatus {
+                            value: "loaded".to_string(),
+                            args: None,
+                            preset: None,
+                        },
+                        preset: None,
+                    };
+                    let load_insert = model_load_to_insert(&min_load, &min_entry);
+                    let load_id = model_load::upsert(&self.pool, &load_insert).await?;
 
-                    // Build scrape insert from metrics
-                    let mut scrape_insert: db::scrape::ScrapeInsert =
-                        (full_metrics, now).into();
-                    scrape_insert.model_name = entry.model.clone();
-                    scrape_insert.model_created = new_created;
-                    scrape_insert.model_load_id = new_load_id;
+                    let full_metrics = &active.metrics;
+                    let reload_event = self.detect_reload(&active.model, 0, full_metrics.tasks.completed).await?;
 
-                    let (new_tasks, scrape_id) = self.process_metrics(
-                        &entry.model, new_created, new_load_id,
-                        &full_metrics.recent, &scrape_insert,
-                    ).await?;
-                    total_new_tasks += new_tasks;
-                    total_scrapes += if scrape_id > 0 { 1 } else { 0 };
-                }
-                ReloadEvent::FirstScrape | ReloadEvent::SameSession { .. } => {
-                    let mut scrape_insert: db::scrape::ScrapeInsert =
-                        (full_metrics, now).into();
-                    scrape_insert.model_name = entry.model.clone();
-                    scrape_insert.model_created = entry.created;
-                    scrape_insert.model_load_id = load_id;
+                    match reload_event {
+                        ReloadEvent::ReloadDetected { .. } => {
+                            let old_id = load_id;
+                            model_load::close(&self.pool, old_id, now).await?;
+                            let new_created = 1;
+                            let new_load_id = model_load::upsert(&self.pool, &model_load_to_insert(&min_load, &min_entry)).await?;
 
-                    let (new_tasks, scrape_id) = self.process_metrics(
-                        &entry.model, entry.created, load_id,
-                        &full_metrics.recent, &scrape_insert,
-                    ).await?;
-                    total_new_tasks += new_tasks;
-                    total_scrapes += if scrape_id > 0 { 1 } else { 0 };
+                            let mut scrape_insert: db::scrape::ScrapeInsert =
+                                (full_metrics, now).into();
+                            scrape_insert.model_name = active.model.clone();
+                            scrape_insert.model_created = new_created;
+                            scrape_insert.model_load_id = new_load_id;
+
+                            let (new_tasks, scrape_id) = self.process_metrics(
+                                &active.model, new_created, new_load_id,
+                                &full_metrics.recent, &scrape_insert,
+                            ).await?;
+                            total_new_tasks += new_tasks;
+                            total_scrapes += if scrape_id > 0 { 1 } else { 0 };
+                        }
+                        ReloadEvent::FirstScrape | ReloadEvent::SameSession { .. } => {
+                            let mut scrape_insert: db::scrape::ScrapeInsert =
+                                (full_metrics, now).into();
+                            scrape_insert.model_name = active.model.clone();
+                            scrape_insert.model_created = 0;
+                            scrape_insert.model_load_id = load_id;
+
+                            tracing::debug!(
+                                model = active.model,
+                                task_count = full_metrics.recent.len(),
+                                load_id,
+                                "Processing metrics for metrics-only model"
+                            );
+
+                            let (new_tasks, scrape_id) = self.process_metrics(
+                                &active.model, 0, load_id,
+                                &full_metrics.recent, &scrape_insert,
+                            ).await?;
+                            total_new_tasks += new_tasks;
+                            total_scrapes += if scrape_id > 0 { 1 } else { 0 };
+                            tracing::debug!(
+                                model = active.model,
+                                new_tasks,
+                                scrape_id,
+                                "Finished processing metrics"
+                            );
+                        }
+                    }
                 }
             }
         }

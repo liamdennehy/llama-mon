@@ -3,28 +3,15 @@
 //! Polls a llama-server's `/models` and `/metrics` endpoints and stores
 //! per-task performance data in SQLite for statistical analysis.
 
-mod config;
-mod db;
-mod http_client;
-mod metrics_api;
-mod models_api;
-mod parse;
-mod poller;
-mod preset;
-
-use poller::{Poller, SignalAction};
-
 use anyhow::Result;
 use futures::StreamExt;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::config::Config;
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     // Load .env file first (silently), then parse CLI args
-    let mut config = Config::load();
+    let mut config = llama_mon::config::Config::load();
     config.resolve()?;
 
     // Initialize logging
@@ -42,15 +29,15 @@ async fn main() -> Result<()> {
         .with(fmt_layer)
         .init();
 
-    let server_url = config.resolve()?;
+    let server_url = config.resolved_url().expect("config not resolved");
 
     // Open database
-    let pool = db::open_pool(&config.db_path).await?;
-    db::schema::init_db(&pool).await?;
+    let pool = llama_mon::db::open_pool(&config.db_path).await?;
+    llama_mon::db::schema::init_db(&pool).await?;
     tracing::info!("Database initialized");
 
     // Signal handler task — dispatches to channel
-    let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel::<SignalAction>();
+    let (action_tx, action_rx) = tokio::sync::mpsc::unbounded_channel::<llama_mon::poller::SignalAction>();
     let mut signals = signal_hook_tokio::Signals::new([
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
@@ -60,9 +47,9 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         while let Some(sig) = signals.next().await {
             let action = match sig {
-                signal_hook::consts::SIGINT | signal_hook::consts::SIGTERM => SignalAction::Shutdown,
-                signal_hook::consts::SIGHUP => SignalAction::DumpConfig,
-                signal_hook::consts::SIGUSR1 => SignalAction::DumpStats,
+                signal_hook::consts::SIGINT | signal_hook::consts::SIGTERM => llama_mon::poller::SignalAction::Shutdown,
+                signal_hook::consts::SIGHUP => llama_mon::poller::SignalAction::DumpConfig,
+                signal_hook::consts::SIGUSR1 => llama_mon::poller::SignalAction::DumpStats,
                 _ => continue,
             };
             if action_tx.send(action).is_err() {
@@ -78,11 +65,12 @@ async fn main() -> Result<()> {
         timeout = ?config.timeout_duration(),
         verbose = config.verbose,
         model_filter = ?config.models,
+        fail_fast = config.fail_fast,
         "llama-mon starting"
     );
 
     // Create and run the poller
-    let mut poller = Poller::new(config, pool);
+    let mut poller = llama_mon::poller::Poller::new(config, pool);
     loop {
         tokio::select! {
             result = poller.run(action_rx) => {

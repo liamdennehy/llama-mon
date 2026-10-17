@@ -15,6 +15,7 @@ use thiserror::Error;
 /// environment variables. CLI args override env vars which override defaults.
 #[derive(Debug, Parser)]
 #[command(name = "llama-mon", about = "llama.cpp inference server metrics monitor")]
+#[derive(Clone)]
 pub struct Config {
     /// URL of the llama-server instance
     #[arg(long = "server", env = "LLAMA_MON_SERVER_URL", default_value = "http://localhost:8080")]
@@ -32,6 +33,10 @@ pub struct Config {
     #[arg(long = "timeout", env = "LLAMA_MON_TIMEOUT", default_value = "10s")]
     pub timeout: humantime::Duration,
 
+    /// Resolved server URL (populated by `resolve()`, not from CLI).
+    #[arg(skip)]
+    pub _resolved_url: Option<url::Url>,
+
     /// Enable verbose logging
     #[arg(long = "verbose", env = "LLAMA_MON_VERBOSE")]
     pub verbose: bool,
@@ -40,6 +45,11 @@ pub struct Config {
     /// Can be specified multiple times: --model foo --model bar
     #[arg(long = "model", short = 'm', env = "LLAMA_MON_MODEL")]
     pub models: Vec<String>,
+
+    /// Exit after the first unsuccessful poll cycle instead of looping.
+    /// Useful for debugging transient errors.
+    #[arg(long = "fail-fast")]
+    pub fail_fast: bool,
 }
 
 #[derive(Error, Debug)]
@@ -87,6 +97,7 @@ impl Config {
         std::fs::create_dir_all(parent)?;
 
         let url = url::Url::parse(&self.server_url)?;
+        self._resolved_url = Some(url.clone());
 
         // Validate poll_interval >= 1s (warn if < 3s)
         let poll_dur = self.poll_duration();
@@ -117,6 +128,25 @@ impl Config {
         !self.models.is_empty()
     }
 
+    /// Whether all models should be scraped (no filter or explicit "all").
+    pub fn is_all_models(&self) -> bool {
+        self.models.is_empty() || self.models.iter().any(|m| m == "all")
+    }
+
+    /// Check if a model name matches the current filter.
+    /// Returns `true` if no filter is active (all models match).
+    pub fn model_matches(&self, model_name: &str) -> bool {
+        if self.is_all_models() {
+            return true;
+        }
+        self.models.iter().any(|m| m.eq_ignore_ascii_case(model_name))
+    }
+
+    /// Return the resolved server URL (set by `resolve()`).
+    pub fn resolved_url(&self) -> Option<&url::Url> {
+        self._resolved_url.as_ref()
+    }
+
     /// Convert to a tokio-compatible Duration.
     pub fn poll_duration(&self) -> Duration {
         self.poll_interval.into()
@@ -141,6 +171,8 @@ mod tests {
             timeout: humantime::Duration::from(std::time::Duration::from_secs(10)),
             verbose: false,
             models: vec![],
+            fail_fast: false,
+            _resolved_url: None,
         };
         let url = url::Url::parse(&config.server_url).unwrap();
         assert_eq!(url.port(), Some(8080));
@@ -156,6 +188,8 @@ mod tests {
             timeout: humantime::Duration::from(std::time::Duration::from_secs(10)),
             verbose: false,
             models: vec!["foo".to_string(), "bar".to_string()],
+            fail_fast: false,
+            _resolved_url: None,
         };
         assert!(config.has_model_filter());
         assert_eq!(config.models.len(), 2);

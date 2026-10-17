@@ -71,7 +71,9 @@ impl HttpClient {
 
             tracing::debug!(url = %url, attempt, "Fetching");
 
-            match self.client.get(url.clone()).send().await {
+            match self.client.get(url.clone())
+                .header("Accept", "application/json")
+                .send().await {
                 Ok(response) => {
                     let status = response.status();
                     let elapsed = started.elapsed();
@@ -83,10 +85,11 @@ impl HttpClient {
                     );
 
                     if status.is_success() {
-                        let body = response.text().await?;
+                        let body_bytes = response.bytes().await?;
+                        let body = String::from_utf8_lossy(&body_bytes);
                         // Log truncated raw body for verbose/debug mode
                         let truncated = body.chars().take(256).collect::<String>();
-                        tracing::debug!(response = truncated, "Raw JSON response");
+                        tracing::debug!(url = %url, status = status.as_u16(), body_len = body.len(), response = truncated, "Raw JSON response");
                         return Ok(serde_json::from_str(&body)?);
                     }
 
@@ -128,20 +131,83 @@ impl HttpClient {
     }
 
     /// Fetch `/models` endpoint.
+    ///
+    /// No query parameters — the llama-server `/models` endpoint does not
+    /// accept a `?model=` parameter. All model filtering is done client-side.
     pub async fn fetch_models(&self) -> Result<ModelsResponse, HttpError> {
         self.get_json("/models").await
     }
 
-    /// Fetch `/metrics?model=<name>` endpoint.
-    pub async fn fetch_metrics(&self, model_name: &str) -> Result<MetricsResponse, HttpError> {
-        let path = format!(
-            "/metrics?model={}",
-            percent_encoding::utf8_percent_encode(
-                model_name,
-                percent_encoding::NON_ALPHANUMERIC
-            )
-        );
-        self.get_json(&path).await
+    /// Fetch `/metrics?model=all` endpoint.
+    ///
+    /// The live llama-server requires `model=all` when multiple models are
+    /// configured. Returns aggregated metrics across all active models.
+    pub async fn fetch_metrics(&self) -> Result<MetricsResponse, HttpError> {
+        let mut url = self.base_url.clone();
+        url.set_path("/metrics");
+        url.set_query(Some("model=all"));
+
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let started = Instant::now();
+
+            tracing::debug!(url = %url, attempt, "Fetching /metrics");
+
+            match self.client.get(url.clone())
+                .header("Accept", "application/json")
+                .send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let elapsed = started.elapsed();
+                    tracing::debug!(
+                        url = %url,
+                        status = status.as_u16(),
+                        duration_ms = elapsed.as_millis(),
+                        "Response"
+                    );
+
+                    if status.is_success() {
+                        let body = response.text().await?;
+                        let truncated = body.chars().take(256).collect::<String>();
+                        tracing::debug!(response = truncated, "Raw JSON response");
+                        return Ok(serde_json::from_str(&body)?);
+                    }
+
+                    let status_code = status.as_u16();
+                    let body = response.text().await.unwrap_or_default();
+                    let truncated = body.chars().take(256).collect::<String>();
+
+                    if is_retryable_status(status_code) && attempt <= self.max_retries {
+                        let backoff = Duration::from_millis(200 * attempt as u64);
+                        tracing::warn!(
+                            status = status_code,
+                            attempt,
+                            max_retries = self.max_retries,
+                            backoff_ms = backoff.as_millis(),
+                            "Retryable HTTP status, retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+
+                    return Err(HttpError::Status(status_code, truncated));
+                }
+                Err(e) if attempt <= self.max_retries && is_transient(&e) => {
+                    let backoff = Duration::from_millis(200 * attempt as u64);
+                    tracing::warn!(
+                        error = %e,
+                        attempt,
+                        max_retries = self.max_retries,
+                        backoff_ms = backoff.as_millis(),
+                        "Transient error, retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                Err(e) => return Err(HttpError::Http(e)),
+            }
+        }
     }
 }
 
