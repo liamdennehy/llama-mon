@@ -1,6 +1,6 @@
 [package]
 name = "llama-mon"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [[bin]]
@@ -28,6 +28,7 @@ humantime = "2"
 percent-encoding = "2"
 url = "2"
 dotenvy = "0.15"
+axum = { version = "0.8", features = ["macros"] }
 
 [dev-dependencies]
 tempfile = "3"

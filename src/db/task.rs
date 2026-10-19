@@ -5,6 +5,26 @@ use std::collections::HashSet;
 
 use crate::db::DbError;
 
+/// A task row returned by the dashboard API.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct TaskRow {
+    pub task_id: i64,
+    pub model_name: String,
+    pub slot_id: i64,
+    pub n_prompt_cached: i64,
+    pub n_prompt_processed: i64,
+    pub prompt_ms: f64,
+    pub prompt_tps: f64,
+    pub prompt_per_token_ms: f64,
+    pub n_gen: i64,
+    pub gen_ms: f64,
+    pub gen_tps: f64,
+    pub gen_per_token_ms: f64,
+    pub n_draft_tokens: i64,
+    pub n_draft_accepted: i64,
+    pub captured_at: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskInsert {
     pub task_id: i64,
@@ -65,19 +85,17 @@ pub async fn bulk_insert(
     Ok(result.rows_affected() as usize)
 }
 
-/// Get the set of task_ids seen in the most recent scrape for this model load.
+/// Get the set of task_ids seen in the most recent scrape for this model.
 pub async fn get_seen_task_ids(
     pool: &SqlitePool,
     model_name: &str,
-    model_created: i64,
 ) -> Result<HashSet<i64>, DbError> {
     let csv: Option<String> = sqlx::query_scalar::<_, String>(
         r#"SELECT task_ids_seen FROM scrapes
-           WHERE model_name = ? AND model_created = ?
+           WHERE model_name = ?
            ORDER BY scraped_at DESC LIMIT 1"#
     )
     .bind(model_name)
-    .bind(model_created)
     .fetch_optional(pool)
     .await?;
 
@@ -92,15 +110,15 @@ pub async fn get_seen_task_ids(
 pub async fn get_last_completed_counter(
     pool: &SqlitePool,
     model_name: &str,
-    model_created: i64,
 ) -> Result<Option<i64>, DbError> {
+    // Query the latest scrape for this model regardless of model_created,
+    // since the server's `created` timestamp may change between polls.
     let val: Option<i64> = sqlx::query_scalar::<_, i64>(
         r#"SELECT tasks_completed FROM scrapes
-           WHERE model_name = ? AND model_created = ?
+           WHERE model_name = ?
            ORDER BY scraped_at DESC LIMIT 1"#
     )
     .bind(model_name)
-    .bind(model_created)
     .fetch_optional(pool)
     .await?;
     Ok(val)
@@ -124,8 +142,8 @@ pub async fn get_all_task_ids_for_load(
 mod tests {
     use super::*;
 
+    /// Uses a real SQLite file — never `:memory:`.
     #[tokio::test]
-    #[ignore = "requires database"]
     async fn test_bulk_insert() {
         let pool = test_pool().await;
         let tasks = vec![
@@ -154,8 +172,8 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    /// Uses a real SQLite file — never `:memory:`.
     #[tokio::test]
-    #[ignore = "requires database"]
     async fn test_bulk_insert_duplicate_skipped() {
         let pool = test_pool().await;
         let tasks = vec![TaskInsert {
@@ -174,9 +192,82 @@ mod tests {
         assert_eq!(c2, 0); // duplicate should be ignored
     }
 
+    /// Creates a pool backed by a real file in a unique temp directory.
     async fn test_pool() -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let _guard = crate::db::DB_TEST_POOL_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        use sqlx::sqlite::SqliteConnectOptions;
+        let opts = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .read_only(false);
+        let pool = SqlitePool::connect_with(opts).await.unwrap();
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await
+            .unwrap();
         crate::db::schema::init_db(&pool).await.unwrap();
+        // Insert a model_load so FK-constrained tasks/scrapes can reference id=1
+        sqlx::query(
+            "INSERT INTO model_loads (model_name, created, status, ctx_size) VALUES (?, ?, ?, ?)"
+        )
+        .bind("test-model")
+        .bind(1000000000i64)
+        .bind("loaded")
+        .bind(4096i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let _ = dir;
         pool
     }
+}
+
+// ── Dashboard query helpers ──────────────────────────────────
+
+/// Fetch recent tasks, optionally filtered by model name.
+/// Uses the `v_task_summary` view to avoid repeating the JOIN.
+pub async fn get_recent(
+    pool: &SqlitePool,
+    limit: usize,
+    hours: u64,
+    model_name: Option<&str>,
+) -> Result<Vec<TaskRow>, DbError> {
+    let sql = match model_name {
+        Some(_name) => format!(
+            "SELECT task_id, model_name, slot_id, n_prompt_cached, \
+             n_prompt_processed, prompt_ms, prompt_tps, prompt_per_token_ms, \
+             n_gen, gen_ms, gen_tps, gen_per_token_ms, \
+             n_draft_tokens, n_draft_accepted, captured_at \
+             FROM v_task_summary \
+             WHERE model_name = ? AND captured_at >= unixepoch('now', ?) \
+             ORDER BY captured_at DESC LIMIT {}",
+            limit
+        ),
+        None => format!(
+            "SELECT task_id, model_name, slot_id, n_prompt_cached, \
+             n_prompt_processed, prompt_ms, prompt_tps, prompt_per_token_ms, \
+             n_gen, gen_ms, gen_tps, gen_per_token_ms, \
+             n_draft_tokens, n_draft_accepted, captured_at \
+             FROM v_task_summary \
+             WHERE captured_at >= unixepoch('now', ?) \
+             ORDER BY captured_at DESC LIMIT {}",
+            limit
+        ),
+    };
+
+    let rows: Vec<TaskRow> = if let Some(name) = model_name {
+        sqlx::query_as::<_, TaskRow>(&sql)
+            .bind(name)
+            .bind(format!("-{hours} hours"))
+            .fetch_all(pool)
+            .await?
+    } else {
+        sqlx::query_as::<_, TaskRow>(&sql)
+            .bind(format!("-{hours} hours"))
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(rows)
 }

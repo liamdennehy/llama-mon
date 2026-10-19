@@ -43,4 +43,28 @@ llama-mon is a Rust 2024 async daemon that polls a llama.cpp inference server's 
 - Unit tests go in the same file as the code (`#[cfg(test)] mod tests`)
 - Test preset parsing against the sample in `docs/models-output.md`
 - Test metrics parsing against the sample in `docs/metrics-output.md`
-- No integration tests yet — that's a Phase 5 concern
+- Integration tests in `tests/integration.rs` target a live llama-server (default: `http://10.100.0.1:8214`)
+- Integration tests use `skip_unreachable` helper — they pass on CI without a live server
+
+## Web Dashboard
+
+- Dashboard is a single file: `web/index.html` — no build step, no framework
+- Static files are embedded in the binary via `include_bytes!` in `web/static_files.rs`
+- API endpoints are split: `/api/stats/summary`, `/api/models`, `/api/scrapes`, `/api/tasks`
+- All 3 data endpoints share query params: `limit`, `model`, `time_range`
+- Frontend fetches all endpoints in parallel via `Promise.all`
+- Theme (dark/light) persisted in `localStorage` as `llama-mon-theme`
+- Auto-refresh interval: 30 seconds (toggleable)
+- CSV export: scrapes only, ISO timestamps
+
+## Web Server Modes
+
+llama-mon supports three operational modes:
+
+| Mode | `--no-web` | `--no-scraper` | Description |
+|------|-----------|----------------|-------------|
+| Full daemon | off | off | Polls + persists + serves dashboard |
+| Scraper only | on | off | Polls + persists, no web server |
+| Reporter only | off | on | No polling, serves dashboard |
+
+Shutdown uses a shared `tokio::sync::broadcast::channel(1)` between poller and web server.

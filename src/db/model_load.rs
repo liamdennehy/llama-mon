@@ -4,7 +4,7 @@ use sqlx::SqlitePool;
 
 use crate::db::DbError;
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct ModelLoadRow {
     pub id: i64,
     pub model_name: String,
@@ -26,7 +26,20 @@ pub struct ModelLoadRow {
     pub kv_unified: Option<i64>,
     pub context_bytes: Option<i64>,
     pub model_bytes: Option<i64>,
-    pub scrape_count: i64,
+    // Speculative decoding and serving knobs
+    pub cache_ram: Option<i64>,
+    pub cache_reuse: Option<i64>,
+    pub checkpoint_min_step: Option<i64>,
+    pub draft_p_min: Option<f64>,
+    pub image_min_tokens: Option<i64>,
+    pub load_mode: Option<String>,
+    pub op_offload: Option<String>,
+    pub reasoning: Option<i64>,
+    pub reasoning_budget: Option<i64>,
+    pub reasoning_format: Option<String>,
+    pub spec_draft_n_max: Option<i64>,
+    pub spec_type: Option<String>,
+    pub swa_checkpoints: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +61,20 @@ pub struct ModelLoadInsert<'a> {
     pub kv_unified: Option<i64>,
     pub context_bytes: Option<i64>,
     pub model_bytes: Option<i64>,
+    // Speculative decoding and serving knobs
+    pub cache_ram: Option<i64>,
+    pub cache_reuse: Option<i64>,
+    pub checkpoint_min_step: Option<i64>,
+    pub draft_p_min: Option<f64>,
+    pub image_min_tokens: Option<i64>,
+    pub load_mode: Option<&'a str>,
+    pub op_offload: Option<&'a str>,
+    pub reasoning: Option<i64>,
+    pub reasoning_budget: Option<i64>,
+    pub reasoning_format: Option<&'a str>,
+    pub spec_draft_n_max: Option<i64>,
+    pub spec_type: Option<&'a str>,
+    pub swa_checkpoints: Option<i64>,
 }
 
 /// Upsert a model load. Returns the existing or newly inserted id.
@@ -70,7 +97,11 @@ pub async fn upsert(
                 parallel = ?, threads = ?, threads_batch = ?, n_gpu_layers = ?,
                 cache_type_k = ?, cache_type_v = ?,
                 flash_attn = ?, kv_unified = ?,
-                context_bytes = ?, model_bytes = ?
+                context_bytes = ?, model_bytes = ?,
+                cache_ram = ?, cache_reuse = ?, checkpoint_min_step = ?,
+                draft_p_min = ?, image_min_tokens = ?, load_mode = ?, op_offload = ?,
+                reasoning = ?, reasoning_budget = ?, reasoning_format = ?,
+                spec_draft_n_max = ?, spec_type = ?, swa_checkpoints = ?
             WHERE id = ?"#
         )
         .bind(ml.status)
@@ -88,6 +119,19 @@ pub async fn upsert(
         .bind(ml.kv_unified)
         .bind(ml.context_bytes)
         .bind(ml.model_bytes)
+        .bind(ml.cache_ram)
+        .bind(ml.cache_reuse)
+        .bind(ml.checkpoint_min_step)
+        .bind(ml.draft_p_min)
+        .bind(ml.image_min_tokens)
+        .bind(ml.load_mode)
+        .bind(ml.op_offload)
+        .bind(ml.reasoning)
+        .bind(ml.reasoning_budget)
+        .bind(ml.reasoning_format)
+        .bind(ml.spec_draft_n_max)
+        .bind(ml.spec_type)
+        .bind(ml.swa_checkpoints)
         .bind(id)
         .execute(pool)
         .await?;
@@ -99,8 +143,12 @@ pub async fn upsert(
                 parallel, threads, threads_batch, n_gpu_layers,
                 cache_type_k, cache_type_v,
                 flash_attn, kv_unified,
-                context_bytes, model_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                context_bytes, model_bytes,
+                cache_ram, cache_reuse, checkpoint_min_step,
+                draft_p_min, image_min_tokens, load_mode, op_offload,
+                reasoning, reasoning_budget, reasoning_format,
+                spec_draft_n_max, spec_type, swa_checkpoints
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id"#
         )
         .bind(ml.model_name)
@@ -120,6 +168,19 @@ pub async fn upsert(
         .bind(ml.kv_unified)
         .bind(ml.context_bytes)
         .bind(ml.model_bytes)
+        .bind(ml.cache_ram)
+        .bind(ml.cache_reuse)
+        .bind(ml.checkpoint_min_step)
+        .bind(ml.draft_p_min)
+        .bind(ml.image_min_tokens)
+        .bind(ml.load_mode)
+        .bind(ml.op_offload)
+        .bind(ml.reasoning)
+        .bind(ml.reasoning_budget)
+        .bind(ml.reasoning_format)
+        .bind(ml.spec_draft_n_max)
+        .bind(ml.spec_type)
+        .bind(ml.swa_checkpoints)
         .fetch_one(pool)
         .await?;
         Ok(id)
@@ -167,17 +228,6 @@ pub async fn update_status(
     Ok(())
 }
 
-/// Increment the scrape_count for a model load.
-pub async fn increment_scrape_count(pool: &SqlitePool, id: i64) -> Result<(), DbError> {
-    sqlx::query(
-        "UPDATE model_loads SET scrape_count = scrape_count + 1 WHERE id = ?"
-    )
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Get all model_load ids for a given model name.
 pub async fn get_ids_by_name(pool: &SqlitePool, model_name: &str) -> Result<Vec<i64>, DbError> {
     let ids: Vec<i64> = sqlx::query_scalar(
@@ -195,13 +245,35 @@ pub async fn get_by_id(pool: &SqlitePool, id: i64) -> Result<Option<ModelLoadRow
         r#"SELECT id, model_name, created, status, loaded_at, unloaded_at,
                 preset_raw, ctx_size, n_batch, n_ubatch, parallel, threads,
                 threads_batch, n_gpu_layers, cache_type_k, cache_type_v,
-                flash_attn, kv_unified, context_bytes, model_bytes, scrape_count
+                flash_attn, kv_unified, context_bytes, model_bytes,
+                cache_ram, cache_reuse, checkpoint_min_step, draft_p_min,
+                image_min_tokens, load_mode, op_offload, reasoning,
+                reasoning_budget, reasoning_format, spec_draft_n_max,
+                spec_type, swa_checkpoints
            FROM model_loads WHERE id = ?"#
     )
     .bind(id)
     .fetch_optional(pool)
     .await?;
     Ok(row)
+}
+
+/// Get all model loads, ordered by created descending.
+pub async fn get_all(pool: &SqlitePool) -> Result<Vec<ModelLoadRow>, DbError> {
+    let rows: Vec<ModelLoadRow> = sqlx::query_as(
+        r#"SELECT id, model_name, created, status, loaded_at, unloaded_at,
+                preset_raw, ctx_size, n_batch, n_ubatch, parallel, threads,
+                threads_batch, n_gpu_layers, cache_type_k, cache_type_v,
+                flash_attn, kv_unified, context_bytes, model_bytes,
+                cache_ram, cache_reuse, checkpoint_min_step, draft_p_min,
+                image_min_tokens, load_mode, op_offload, reasoning,
+                reasoning_budget, reasoning_format, spec_draft_n_max,
+                spec_type, swa_checkpoints
+           FROM model_loads ORDER BY created DESC"#
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -234,6 +306,19 @@ mod tests {
             kv_unified: Some(1),
             context_bytes: Some(1000),
             model_bytes: Some(2000),
+            cache_ram: None,
+            cache_reuse: None,
+            checkpoint_min_step: None,
+            draft_p_min: None,
+            image_min_tokens: None,
+            load_mode: None,
+            op_offload: None,
+            reasoning: None,
+            reasoning_budget: None,
+            reasoning_format: None,
+            spec_draft_n_max: None,
+            spec_type: None,
+            swa_checkpoints: None,
         };
         let id = upsert(&pool, &insert).await.unwrap();
         assert!(id > 0);
@@ -261,6 +346,19 @@ mod tests {
             kv_unified: None,
             context_bytes: None,
             model_bytes: None,
+            cache_ram: None,
+            cache_reuse: None,
+            checkpoint_min_step: None,
+            draft_p_min: None,
+            image_min_tokens: None,
+            load_mode: None,
+            op_offload: None,
+            reasoning: None,
+            reasoning_budget: None,
+            reasoning_format: None,
+            spec_draft_n_max: None,
+            spec_type: None,
+            swa_checkpoints: None,
         };
         let id1 = upsert(&pool, &insert).await.unwrap();
         let id2 = upsert(&pool, &insert).await.unwrap();
@@ -281,6 +379,11 @@ mod tests {
             threads_batch: None, n_gpu_layers: None, cache_type_k: None,
             cache_type_v: None, flash_attn: None, kv_unified: None,
             context_bytes: None, model_bytes: None,
+            cache_ram: None, cache_reuse: None, checkpoint_min_step: None,
+            draft_p_min: None, image_min_tokens: None, load_mode: None,
+            op_offload: None, reasoning: None, reasoning_budget: None,
+            reasoning_format: None, spec_draft_n_max: None, spec_type: None,
+            swa_checkpoints: None,
         };
         let id = upsert(&pool, &insert).await.unwrap();
 

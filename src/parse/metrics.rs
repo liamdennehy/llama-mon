@@ -133,8 +133,9 @@ pub struct KvCacheMetrics {
 }
 
 /// Slot state info.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct SlotMetrics {
+    #[serde(default)]
     pub id: i64,
 }
 
@@ -161,7 +162,7 @@ pub struct TaskRecord {
     pub n_gen: i64,
     #[serde(alias = "draft_tokens")]
     pub n_draft_tokens: i64,
-    #[serde(alias = "n_draft_accepted", default)]
+    #[serde(alias = "n_draft_accepted", alias = "draft_accepted", default)]
     pub n_draft_accepted: i64,
     pub prompt_ms: f64,
     pub gen_ms: f64,
@@ -317,6 +318,65 @@ mod tests {
         assert_eq!(resp.active[0].metrics.recent[0].n_prompt_processed, 44);
         assert_eq!(resp.active[0].metrics.recent[0].n_gen, 10);
         assert!((resp.active[0].metrics.recent[0].prompt_tps - 29.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_aggregated_response_with_populated_slots_and_draft_accepted() {
+        // Real response shape from llama-server when slots are active
+        // and field names use the newer convention (prompt_cached, draft_accepted)
+        let json = r#"{
+            "active": [{
+                "model": "test-model",
+                "status": "loaded",
+                "metrics": {
+                    "context_max": 131072,
+                    "tasks": {"processing": 1, "queued": 0, "completed": 337, "duration_seconds": 25277.3},
+                    "prompt": {"tokens_total": 370487, "tokens_cached_total": 22575409, "tokens_processed": 371511},
+                    "prediction": {"tokens_total": 88927, "tokens_processed": 88927},
+                    "decode": {"total": 29722, "n_tokens_max": 115352, "n_busy_slots": 29742,
+                        "speculative": {"draft_tokens_total": 63464, "draft_steps_total": 23840,
+                            "accepted_tokens": {"total": 60926, "draft_pos_0": 23154, "draft_pos_1": 19948, "draft_pos_2": 17824}}},
+                    "kvcache": {"active_tokens": 0},
+                    "slots": [
+                        {"id": 1, "prompt": 90, "cache": 50731, "n_past": 50821, "n_beg": 90,
+                         "cached_tokens": 90, "prompt_eval_time": 27000, "tokens_count": 238,
+                         "tokens_evicted": 0}
+                    ],
+                    "memory": {"context_bytes": 1952972800, "model_bytes": 27076821536},
+                    "recent": [
+                        {"task_id": 188892, "slot": 1, "prompt_cached": 51582, "prompt_new": 90,
+                         "generated": 160, "draft_tokens": 100, "draft_accepted": 95,
+                         "prompt_ms": 5352.2, "gen_ms": 20855.3,
+                         "prompt_per_token_ms": 59.5, "gen_per_token_ms": 131.2,
+                         "prompt_tps": 16.8, "gen_tps": 7.6}
+                    ]
+                }
+            }],
+            "available": [{"model": "other", "status": "unloaded"}],
+            "wait": [],
+            "error": []
+        }"#;
+
+        let resp: MetricsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.active.len(), 1);
+        let m = &resp.active[0].metrics;
+        assert_eq!(m.context_max, 131072);
+        assert_eq!(m.tasks.completed, 337);
+        assert_eq!(m.decode.speculative.as_ref().unwrap().draft_tokens_total, 63464);
+        // Slots with id field
+        assert_eq!(m.slots.len(), 1);
+        assert_eq!(m.slots[0].id, 1);
+        // Recent tasks using draft_accepted (not n_draft_accepted)
+        assert_eq!(m.recent.len(), 1);
+        assert_eq!(m.recent[0].n_gen, 160);
+        assert_eq!(m.recent[0].n_draft_accepted, 95);
+        assert_eq!(m.recent[0].n_prompt_cached, 51582);
+        assert_eq!(m.recent[0].n_prompt_processed, 90);
+        // ScrapeInsert conversion
+        let scrape: ScrapeInsert = (m, 1000).into();
+        assert_eq!(scrape.tasks_completed, 337);
+        assert_eq!(scrape.prompt_tokens_cached, Some(22575409));
+        assert_eq!(scrape.memory_model_bytes, Some(27076821536));
     }
 
     #[test]

@@ -30,7 +30,23 @@ $ curl -s http://localhost:8080/metrics?model=example-model -H "Accept: applicat
         "kvcache": {
           "active_tokens": 0
         },
-        "slots": [],
+		"slots": [
+		{
+		  "task_id": 190759,
+		  "slot": 1,
+		  "state": "5 - generating",
+		  "tokens": 61370,
+		  "tokens_prompt_cached": 61323,
+		  "tokens_prompt_new": 47,
+		  "tokens_generated": 256,
+		  "context_max": 131072,
+		  "context_utilization": 47.02,
+		  "elapsed_seconds": 42.1,
+		  "ttft_ms": 5078.9,
+		  "prompt_elapsed_ms": 5078.9,
+		  "gen_elapsed_ms": 36644.6
+		}
+		],
         "memory": {
           "context_bytes": 1879048192,
           "model_bytes": 2959223072

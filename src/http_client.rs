@@ -63,15 +63,29 @@ impl HttpClient {
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, HttpError> {
         let mut url = self.base_url.clone();
         url.set_path(path);
+        Self::do_get_json(&self.client, &url, &mut 0u32, self.max_retries).await
+    }
 
-        let mut attempt = 0u32;
+    /// GET a JSON response from a pre-built URL with retry and logging.
+    async fn get_json_raw<T: DeserializeOwned>(&self, url: &Url) -> Result<T, HttpError> {
+        Self::do_get_json(&self.client, url, &mut 0u32, self.max_retries).await
+    }
+
+    /// Internal: shared retry loop for GET JSON requests.
+    async fn do_get_json<T: DeserializeOwned>(
+        client: &Client,
+        url: &Url,
+        attempt: &mut u32,
+        max_retries: u32,
+    ) -> Result<T, HttpError> {
+        let mut attempt = *attempt;
         loop {
             attempt += 1;
             let started = Instant::now();
 
             tracing::debug!(url = %url, attempt, "Fetching");
 
-            match self.client.get(url.clone())
+            match client.get(url.clone())
                 .header("Accept", "application/json")
                 .send().await {
                 Ok(response) => {
@@ -87,10 +101,21 @@ impl HttpClient {
                     if status.is_success() {
                         let body_bytes = response.bytes().await?;
                         let body = String::from_utf8_lossy(&body_bytes);
-                        // Log truncated raw body for verbose/debug mode
                         let truncated = body.chars().take(256).collect::<String>();
-                        tracing::debug!(url = %url, status = status.as_u16(), body_len = body.len(), response = truncated, "Raw JSON response");
-                        return Ok(serde_json::from_str(&body)?);
+                        tracing::debug!(url = %url, full_url = %url.as_str(), status = status.as_u16(), body_len = body.len(), response = truncated, "Raw JSON response");
+                        return match serde_json::from_str::<T>(&body) {
+                            Ok(v) => Ok(v),
+                            Err(e) => {
+                                tracing::error!(
+                                    url = %url,
+                                    error = %e,
+                                    body_len = body.len(),
+                                    body_preview = %truncated,
+                                    "Failed to deserialize JSON"
+                                );
+                                Err(HttpError::Json(e))
+                            }
+                        };
                     }
 
                     // Handle retryable vs non-retryable status codes
@@ -98,12 +123,12 @@ impl HttpClient {
                     let body = response.text().await.unwrap_or_default();
                     let truncated = body.chars().take(256).collect::<String>();
 
-                    if is_retryable_status(status_code) && attempt <= self.max_retries {
+                    if is_retryable_status(status_code) && attempt <= max_retries {
                         let backoff = Duration::from_millis(200 * attempt as u64);
                         tracing::warn!(
                             status = status_code,
                             attempt,
-                            max_retries = self.max_retries,
+                            max_retries,
                             backoff_ms = backoff.as_millis(),
                             "Retryable HTTP status, retrying"
                         );
@@ -113,12 +138,12 @@ impl HttpClient {
 
                     return Err(HttpError::Status(status_code, truncated));
                 }
-                Err(e) if attempt <= self.max_retries && is_transient(&e) => {
+                Err(e) if attempt <= max_retries && is_transient(&e) => {
                     let backoff = Duration::from_millis(200 * attempt as u64);
                     tracing::warn!(
                         error = %e,
                         attempt,
-                        max_retries = self.max_retries,
+                        max_retries,
                         backoff_ms = backoff.as_millis(),
                         "Transient error, retrying"
                     );
@@ -146,74 +171,30 @@ impl HttpClient {
         let mut url = self.base_url.clone();
         url.set_path("/metrics");
         url.set_query(Some("model=all"));
-
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let started = Instant::now();
-
-            tracing::debug!(url = %url, attempt, "Fetching /metrics");
-
-            match self.client.get(url.clone())
-                .header("Accept", "application/json")
-                .send().await {
-                Ok(response) => {
-                    let status = response.status();
-                    let elapsed = started.elapsed();
-                    tracing::debug!(
-                        url = %url,
-                        status = status.as_u16(),
-                        duration_ms = elapsed.as_millis(),
-                        "Response"
-                    );
-
-                    if status.is_success() {
-                        let body = response.text().await?;
-                        let truncated = body.chars().take(256).collect::<String>();
-                        tracing::debug!(response = truncated, "Raw JSON response");
-                        return Ok(serde_json::from_str(&body)?);
-                    }
-
-                    let status_code = status.as_u16();
-                    let body = response.text().await.unwrap_or_default();
-                    let truncated = body.chars().take(256).collect::<String>();
-
-                    if is_retryable_status(status_code) && attempt <= self.max_retries {
-                        let backoff = Duration::from_millis(200 * attempt as u64);
-                        tracing::warn!(
-                            status = status_code,
-                            attempt,
-                            max_retries = self.max_retries,
-                            backoff_ms = backoff.as_millis(),
-                            "Retryable HTTP status, retrying"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        continue;
-                    }
-
-                    return Err(HttpError::Status(status_code, truncated));
-                }
-                Err(e) if attempt <= self.max_retries && is_transient(&e) => {
-                    let backoff = Duration::from_millis(200 * attempt as u64);
-                    tracing::warn!(
-                        error = %e,
-                        attempt,
-                        max_retries = self.max_retries,
-                        backoff_ms = backoff.as_millis(),
-                        "Transient error, retrying"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-                Err(e) => return Err(HttpError::Http(e)),
-            }
-        }
+        self.get_json_raw(&url).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_metrics_url_construction() {
+        let base: Url = "http://localhost:8080/".parse().unwrap();
+        // Correct approach: set_path + set_query separately
+        let mut url = base.clone();
+        url.set_path("/metrics");
+        url.set_query(Some("model=all"));
+        assert_eq!(url.as_str(), "http://localhost:8080/metrics?model=all");
+
+        // Wrong approach: set_path with embedded query string
+        let mut url2 = base.clone();
+        url2.set_path("/metrics?model=all");
+        // The ? gets URL-encoded to %3F
+        assert!(url2.as_str().contains("%3F"),
+            "set_path with query string encodes ?: {}", url2.as_str());
+    }
 
     #[test]
     fn test_is_retryable_status() {

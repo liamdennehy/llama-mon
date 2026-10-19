@@ -4,16 +4,39 @@ use sqlx::SqlitePool;
 
 use crate::db::DbError;
 
-/// The most recent scrape for a given model load.
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// A scrape row returned by the dashboard API.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct ScrapeRow {
     pub id: i64,
     pub model_name: String,
     pub model_created: i64,
     pub model_load_id: i64,
     pub scraped_at: i64,
+    pub context_max: Option<i64>,
+    pub tasks_processing: i64,
+    pub tasks_queued: i64,
     pub tasks_completed: i64,
+    pub tasks_duration_s: f64,
+    pub prompt_tokens_total: Option<i64>,
+    pub prompt_tokens_cached: Option<i64>,
+    pub prompt_tokens_processed: Option<i64>,
+    pub prediction_tokens_total: Option<i64>,
+    pub prediction_tokens_processed: Option<i64>,
+    pub decode_total: Option<i64>,
+    pub kvcache_active_tokens: Option<i64>,
+    pub memory_context_bytes: Option<i64>,
+    pub memory_model_bytes: Option<i64>,
     pub task_ids_seen: String,
+}
+
+/// Cumulative scrape statistics for the dashboard summary.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ScrapeStats {
+    pub total_scrapes: u64,
+    pub total_tasks: u64,
+    pub total_model_loads: u64,
+    pub total_poll_cycles: u64,
+    pub total_reloads: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +109,12 @@ pub async fn get_latest_for_load(
 ) -> Result<Option<ScrapeRow>, DbError> {
     let row: Option<ScrapeRow> = sqlx::query_as(
         r#"SELECT id, model_name, model_created, model_load_id, scraped_at,
-                tasks_completed, task_ids_seen
+                context_max, tasks_processing, tasks_queued, tasks_completed,
+                tasks_duration_s, prompt_tokens_total, prompt_tokens_cached,
+                prompt_tokens_processed, prediction_tokens_total,
+                prediction_tokens_processed, decode_total,
+                kvcache_active_tokens, memory_context_bytes, memory_model_bytes,
+                task_ids_seen
            FROM scrapes
            WHERE model_load_id = ?
            ORDER BY scraped_at DESC LIMIT 1"#
@@ -165,8 +193,8 @@ mod tests {
         assert_eq!(original, parsed);
     }
 
+    /// Uses a real SQLite file — never `:memory:`.
     #[tokio::test]
-    #[ignore = "requires database"]
     async fn test_insert_scrape() {
         let pool = test_pool().await;
         let scrape = ScrapeInsert {
@@ -194,8 +222,8 @@ mod tests {
         assert!(id > 0);
     }
 
+    /// Uses a real SQLite file — never `:memory:`.
     #[tokio::test]
-    #[ignore = "requires database"]
     async fn test_get_latest_for_load() {
         let pool = test_pool().await;
         let scrape = ScrapeInsert {
@@ -223,9 +251,99 @@ mod tests {
         assert!(none.is_none());
     }
 
+    /// Creates an in-memory SQLite pool for testing.
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await
+            .unwrap();
         crate::db::schema::init_db(&pool).await.unwrap();
+        // Insert a model_load so FK-constrained scrapes can reference id=1
+        sqlx::query(
+            "INSERT INTO model_loads (model_name, created, status, ctx_size) VALUES (?, ?, ?, ?)"
+        )
+        .bind("test-model")
+        .bind(1000000000i64)
+        .bind("loaded")
+        .bind(4096i64)
+        .execute(&pool)
+        .await
+        .unwrap();
         pool
     }
+}
+
+// ── Dashboard query helpers ──────────────────────────────────
+
+/// Fetch the most recent scrapes, optionally filtered by model name.
+/// Uses the `v_scrape_summary` view to avoid repeating the JOIN.
+/// Note: model_load_id is not selected from the view (it's implicit via model_name).
+pub async fn get_recent(
+    pool: &SqlitePool,
+    limit: usize,
+    hours: u64,
+    model_name: Option<&str>,
+) -> Result<Vec<ScrapeRow>, DbError> {
+    let sql = match model_name {
+        Some(_name) => format!(
+            "SELECT id, model_name, model_created, model_load_id, scraped_at, context_max, \
+             tasks_processing, tasks_queued, tasks_completed, tasks_duration_s, \
+             prompt_tokens_total, prompt_tokens_cached, prompt_tokens_processed, \
+             prediction_tokens_total, prediction_tokens_processed, decode_total, \
+             kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
+             FROM v_scrape_summary \
+             WHERE model_name = ? AND scraped_at >= unixepoch('now', ?) \
+             ORDER BY scraped_at DESC LIMIT {}",
+            limit
+        ),
+        None => format!(
+            "SELECT id, model_name, model_created, model_load_id, scraped_at, context_max, \
+             tasks_processing, tasks_queued, tasks_completed, tasks_duration_s, \
+             prompt_tokens_total, prompt_tokens_cached, prompt_tokens_processed, \
+             prediction_tokens_total, prediction_tokens_processed, decode_total, \
+             kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
+             FROM v_scrape_summary \
+             WHERE scraped_at >= unixepoch('now', ?) \
+             ORDER BY scraped_at DESC LIMIT {}",
+            limit
+        ),
+    };
+
+    let rows: Vec<ScrapeRow> = if let Some(name) = model_name {
+        sqlx::query_as::<_, ScrapeRow>(&sql)
+            .bind(name)
+            .bind(format!("-{hours} hours"))
+            .fetch_all(pool)
+            .await?
+    } else {
+        sqlx::query_as::<_, ScrapeRow>(&sql)
+            .bind(format!("-{hours} hours"))
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(rows)
+}
+
+/// Compute global cumulative stats from the database.
+pub async fn get_global_stats(pool: &SqlitePool) -> Result<ScrapeStats, DbError> {
+    let stats: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(MAX(tasks_completed), 0), COUNT(DISTINCT model_name), COUNT(*) FROM scrapes"
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let reloads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM model_loads WHERE status = 'unloaded'"
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(ScrapeStats {
+        total_scrapes: stats.0 as u64,
+        total_tasks: stats.1 as u64,
+        total_model_loads: stats.3 as u64,
+        total_poll_cycles: stats.0 as u64, // scrapes ~= poll cycles (one scrape per cycle)
+        total_reloads: reloads as u64,
+    })
 }

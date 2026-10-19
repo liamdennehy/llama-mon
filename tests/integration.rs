@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
-use llama_mon::config::Config;
+use llama_mon::config::{Config, ServerConfig};
 use llama_mon::db;
 use llama_mon::db::model_load::ModelLoadRow;
 use llama_mon::poller::{Poller, PollerError};
@@ -36,7 +36,7 @@ fn make_config() -> Config {
 }
 
 /// Build a config with a custom poll timeout.
-fn make_config_with_timeout(timeout: Duration) -> Config {
+fn make_config_with_timeout(_timeout: Duration) -> Config {
     let db_path = if let Ok(p) = std::env::var("LLAMA_MON_DB_PATH") {
         PathBuf::from(p)
     } else {
@@ -47,15 +47,22 @@ fn make_config_with_timeout(timeout: Duration) -> Config {
     };
     let server_url = std::env::var("LLAMA_MON_SERVER_URL")
         .unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
+    let server = ServerConfig {
+        url: server_url.parse().unwrap_or_else(|_| url::Url::parse(DEFAULT_SERVER_URL).unwrap()),
+        active: true,
+    };
+    let server_urls = vec![server_url];
     Config {
-        server_url,
+        server_urls,
+        servers: vec![server],
         poll_interval: humantime::Duration::from(Duration::from_secs(2)),
         db_path,
         timeout: humantime::Duration::from(Duration::from_secs(5)),
-        _resolved_url: None,
         verbose: true,
         models: vec![],
         fail_fast: false,
+        listen_ip: "127.0.0.1".to_string(),
+        web_port: None,
     }
 }
 
@@ -91,7 +98,8 @@ async fn make_poller(config: Config) -> Result<Poller> {
     resolve_config(&mut cfg);
     let pool = db::open_pool(&cfg.db_path).await?;
     db::schema::init_db(&pool).await?;
-    Ok(Poller::new(cfg, pool))
+    let server = cfg.servers.first().unwrap().clone();
+    Ok(Poller::new(server, cfg, pool))
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +238,7 @@ async fn test_reload_detection() -> Result<()> {
     let pool = poller.pool();
 
     // For a model that was reloaded, there should be multiple model_loads rows
-    let rows: Vec<ModelLoadRow> = sqlx::query_as("SELECT * FROM model_loads ORDER BY created")
+    let _rows: Vec<ModelLoadRow> = sqlx::query_as("SELECT * FROM model_loads ORDER BY created")
         .fetch_all(pool)
         .await?;
 
@@ -284,6 +292,63 @@ async fn test_graceful_shutdown_wal_checkpoint() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Live metrics fetch + parse
+// ---------------------------------------------------------------------------
+
+/// Verify that fetching live metrics from the server and deserializing
+/// succeeds — exercises the full HTTP + serde pipeline including
+/// populated slots, draft metrics, and newer field names.
+#[tokio::test]
+#[ignore = "integration test — requires live llama-server, set LLAMA_MON_SERVER_URL"]
+async fn test_live_metrics_parse() -> Result<()> {
+    use llama_mon::http_client::HttpClient;
+    use llama_mon::parse::MetricsResponse;
+
+    let server_url = std::env::var("LLAMA_MON_SERVER_URL")
+        .unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
+    let parsed: url::Url = server_url.parse()
+        .expect("LLAMA_MON_SERVER_URL must be a valid URL");
+
+    let client = HttpClient::new(parsed, Duration::from_secs(10));
+
+    // Fetch live metrics — this exercises HTTP + full serde deserialization
+    let resp: MetricsResponse = match client.fetch_metrics().await {
+        Ok(r) => r,
+        Err(e) => panic!("fetch_metrics failed: {:?}", e),
+    };
+
+    // Must have at least one active model
+    assert!(!resp.active.is_empty(), "/metrics should have at least one active model");
+
+    // Verify aggregate counters parse correctly
+    let active = &resp.active[0];
+    assert!(!active.model.is_empty(), "active model should have a name");
+    assert!(active.metrics.tasks.completed >= 0, "tasks.completed should be non-negative");
+    assert!(active.metrics.context_max > 0, "context_max should be positive");
+    assert!(active.metrics.memory.context_bytes >= 0, "context_bytes should be non-negative");
+    assert!(active.metrics.memory.model_bytes > 0, "model_bytes should be positive");
+
+    // Speculative decoding metrics (if present)
+    if let Some(spec) = &active.metrics.decode.speculative {
+        assert!(spec.draft_tokens_total >= 0, "draft_tokens_total should be non-negative");
+    }
+
+    // Slots — may be empty when idle, but should parse either way
+    for slot in &active.metrics.slots {
+        assert!(slot.id >= 0, "slot id should be non-negative");
+    }
+
+    // Recent tasks — newer field names (prompt_cached, draft_accepted)
+    for task in &active.metrics.recent {
+        assert!(task.task_id > 0, "task_id should be positive");
+        assert!(task.slot >= 0, "slot should be non-negative");
+        assert!(task.n_gen >= 0, "n_gen should be non-negative");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Utility tests
 // ---------------------------------------------------------------------------
 
@@ -295,15 +360,21 @@ async fn test_poller_handles_unreachable_model() -> Result<()> {
     let db_path = base.join("db/test_unreachable.db");
     let server_url = std::env::var("LLAMA_MON_SERVER_URL")
         .unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string());
+    let server = ServerConfig {
+        url: server_url.parse().unwrap_or_else(|_| url::Url::parse(DEFAULT_SERVER_URL).unwrap()),
+        active: true,
+    };
     let config = Config {
-        server_url: format!("{}/models", server_url),
+        server_urls: vec![server_url],
+        servers: vec![server],
         poll_interval: humantime::Duration::from(Duration::from_secs(2)),
         db_path,
         timeout: humantime::Duration::from(Duration::from_secs(3)),
-        _resolved_url: None,
         verbose: false,
         models: vec![],
         fail_fast: false,
+        listen_ip: "127.0.0.1".to_string(),
+        web_port: None,
     };
     let mut poller = make_poller(config).await?;
 

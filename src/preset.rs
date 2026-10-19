@@ -11,6 +11,11 @@ const KNOWN_KEYS: &[&str] = &[
     "batch-size", "ctx-size", "cache-type-k", "cache-type-v",
     "n-gpu-layers", "parallel", "threads", "threads-batch", "ubatch-size",
     "flash-attn", "kv-unified", "jinja", "cache-prompt",
+    // Tracked — speculative decoding and serving knobs
+    "cache-ram", "cache-reuse", "checkpoint-min-step",
+    "draft-p-min", "image-min-tokens", "load-mode", "op-offload",
+    "reasoning", "reasoning-budget", "reasoning-format",
+    "spec-draft-n-max", "spec-type", "swa-checkpoints",
     // Ignored — known to exist but not relevant for performance analysis
     "model", "log-verbosity", "log-colors", "log-file",
 ];
@@ -32,6 +37,20 @@ pub struct PresetConfig {
     pub kv_unified: Option<bool>,
     pub jinja: Option<bool>,
     pub cache_prompt: Option<bool>,
+    // Speculative decoding and serving knobs
+    pub cache_ram: Option<i64>,
+    pub cache_reuse: Option<i64>,
+    pub checkpoint_min_step: Option<i64>,
+    pub draft_p_min: Option<f64>,
+    pub image_min_tokens: Option<i64>,
+    pub load_mode: Option<String>,
+    pub op_offload: Option<String>,
+    pub reasoning: Option<bool>,
+    pub reasoning_budget: Option<i64>,
+    pub reasoning_format: Option<String>,
+    pub spec_draft_n_max: Option<i64>,
+    pub spec_type: Option<String>,
+    pub swa_checkpoints: Option<i64>,
     /// Keys emitted by the server that are not recognized by llama-mon
     /// at all. Used to emit a one-per-session warning for audit.
     pub unknown_keys: std::collections::BTreeSet<String>,
@@ -77,6 +96,20 @@ impl PresetConfig {
                 "threads"          => config.threads          = value.parse().ok(),
                 "threads-batch"    => config.threads_batch    = value.parse().ok(),
                 "ubatch-size"      => config.ubatch_size      = value.parse().ok(),
+                // Speculative decoding and serving knobs
+                "cache-ram"           => config.cache_ram           = value.parse().ok(),
+                "cache-reuse"         => config.cache_reuse         = value.parse().ok(),
+                "checkpoint-min-step" => config.checkpoint_min_step = value.parse().ok(),
+                "draft-p-min"         => config.draft_p_min         = value.parse().ok(),
+                "image-min-tokens"    => config.image_min_tokens    = value.parse().ok(),
+                "load-mode"           => config.load_mode           = Some(value.to_string()),
+                "op-offload"          => config.op_offload          = Some(value.to_string()),
+                "reasoning"           => config.reasoning           = parse_bool(value),
+                "reasoning-budget"    => config.reasoning_budget    = value.parse().ok(),
+                "reasoning-format"    => config.reasoning_format    = Some(value.to_string()),
+                "spec-draft-n-max"    => config.spec_draft_n_max    = value.parse().ok(),
+                "spec-type"           => config.spec_type           = Some(value.to_string()),
+                "swa-checkpoints"     => config.swa_checkpoints     = value.parse().ok(),
                 // Intentionally ignored — known keys not stored in DB
                 "model" | "log-verbosity" | "log-colors" | "log-file" => {},
                 // Truly unknown — not in KNOWN_KEYS at all
@@ -94,11 +127,11 @@ impl PresetConfig {
 }
 
 /// Parse a boolean value from a preset string.
-/// Handles both `true`/`false` and `0`/`1`.
+/// Handles `true`/`false`, `1`/`0`, and `on`/`off`.
 pub fn parse_bool(value: &str) -> Option<bool> {
     match value {
-        "true" | "1" => Some(true),
-        "false" | "0" => Some(false),
+        "true" | "1" | "on" => Some(true),
+        "false" | "0" | "off" => Some(false),
         _ => None,
     }
 }
@@ -163,6 +196,8 @@ ubatch-size = 256"#;
         assert_eq!(parse_bool("false"), Some(false));
         assert_eq!(parse_bool("1"), Some(true));
         assert_eq!(parse_bool("0"), Some(false));
+        assert_eq!(parse_bool("on"), Some(true));
+        assert_eq!(parse_bool("off"), Some(false));
         assert_eq!(parse_bool("yes"), None);
         assert_eq!(parse_bool(""), None);
     }
@@ -179,5 +214,39 @@ ubatch-size = 256"#;
         let config = PresetConfig::parse("[my-model]");
         assert!(config.unknown_keys.is_empty());
         assert_eq!(config.raw, "[my-model]");
+    }
+
+    #[test]
+    fn test_parse_speculative_decoding_keys() {
+        let raw = r#"[speculative]
+draft-p-min = 0.1
+spec-type = greedy
+spec-draft-n-max = 8
+reasoning = true
+reasoning-budget = 512
+reasoning-format = plaintext
+cache-ram = 4096
+cache-reuse = 16
+checkpoint-min-step = 10
+image-min-tokens = 4
+load-mode = mmap
+op-offload = cpu
+swa-checkpoints = 4"#;
+        let config = PresetConfig::parse(raw);
+        assert_eq!(config.draft_p_min, Some(0.1));
+        assert_eq!(config.spec_type, Some("greedy".to_string()));
+        assert_eq!(config.spec_draft_n_max, Some(8));
+        assert_eq!(config.reasoning, Some(true));
+        assert_eq!(config.reasoning_budget, Some(512));
+        assert_eq!(config.reasoning_format, Some("plaintext".to_string()));
+        assert_eq!(config.cache_ram, Some(4096));
+        assert_eq!(config.cache_reuse, Some(16));
+        assert_eq!(config.checkpoint_min_step, Some(10));
+        assert_eq!(config.image_min_tokens, Some(4));
+        assert_eq!(config.load_mode, Some("mmap".to_string()));
+        assert_eq!(config.op_offload, Some("cpu".to_string()));
+        assert_eq!(config.swa_checkpoints, Some(4));
+        // None of these should be in unknown_keys
+        assert!(config.unknown_keys.is_empty());
     }
 }
