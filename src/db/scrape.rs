@@ -276,7 +276,7 @@ mod tests {
 
 // ── Dashboard query helpers ──────────────────────────────────
 
-/// Fetch the most recent scrapes, optionally filtered by model name.
+/// Fetch the most recent scrapes, optionally filtered by model name and/or a `since` timestamp.
 /// Uses the `v_scrape_summary` view to avoid repeating the JOIN.
 /// Note: model_load_id is not selected from the view (it's implicit via model_name).
 pub async fn get_recent(
@@ -284,43 +284,75 @@ pub async fn get_recent(
     limit: usize,
     hours: u64,
     model_name: Option<&str>,
+    since: Option<i64>,
 ) -> Result<Vec<ScrapeRow>, DbError> {
-    let sql = match model_name {
-        Some(_name) => format!(
-            "SELECT id, model_name, model_created, model_load_id, scraped_at, context_max, \
-             tasks_processing, tasks_queued, tasks_completed, tasks_duration_s, \
-             prompt_tokens_total, prompt_tokens_cached, prompt_tokens_processed, \
-             prediction_tokens_total, prediction_tokens_processed, decode_total, \
-             kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
-             FROM v_scrape_summary \
-             WHERE model_name = ? AND scraped_at >= unixepoch('now', ?) \
-             ORDER BY scraped_at DESC LIMIT {}",
-            limit
-        ),
-        None => format!(
-            "SELECT id, model_name, model_created, model_load_id, scraped_at, context_max, \
-             tasks_processing, tasks_queued, tasks_completed, tasks_duration_s, \
-             prompt_tokens_total, prompt_tokens_cached, prompt_tokens_processed, \
-             prediction_tokens_total, prediction_tokens_processed, decode_total, \
-             kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
-             FROM v_scrape_summary \
-             WHERE scraped_at >= unixepoch('now', ?) \
-             ORDER BY scraped_at DESC LIMIT {}",
-            limit
-        ),
-    };
-
-    let rows: Vec<ScrapeRow> = if let Some(name) = model_name {
-        sqlx::query_as::<_, ScrapeRow>(&sql)
+    let rows: Vec<ScrapeRow> = match (model_name, since) {
+        (Some(name), Some(s)) => {
+            sqlx::query_as::<_, ScrapeRow>(
+                "SELECT id, model_name, model_created, model_load_id, scraped_at, context_max, \
+                 tasks_processing, tasks_queued, tasks_completed, tasks_duration_s, \
+                 prompt_tokens_total, prompt_tokens_cached, prompt_tokens_processed, \
+                 prediction_tokens_total, prediction_tokens_processed, decode_total, \
+                 kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
+                 FROM v_scrape_summary \
+                 WHERE model_name = ? AND scraped_at > ? \
+                 ORDER BY scraped_at DESC LIMIT ?"
+            )
             .bind(name)
-            .bind(format!("-{hours} hours"))
+            .bind(s)
+            .bind(limit as i64)
             .fetch_all(pool)
             .await?
-    } else {
-        sqlx::query_as::<_, ScrapeRow>(&sql)
-            .bind(format!("-{hours} hours"))
+        }
+        (Some(name), None) => {
+            sqlx::query_as::<_, ScrapeRow>(
+                "SELECT id, model_name, model_created, model_load_id, scraped_at, context_max, \
+                 tasks_processing, tasks_queued, tasks_completed, tasks_duration_s, \
+                 prompt_tokens_total, prompt_tokens_cached, prompt_tokens_processed, \
+                 prediction_tokens_total, prediction_tokens_processed, decode_total, \
+                 kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
+                 FROM v_scrape_summary \
+                 WHERE model_name = ? AND scraped_at >= unixepoch('now', ?) \
+                 ORDER BY scraped_at DESC LIMIT ?"
+            )
+            .bind(name)
+            .bind(&format!("-{hours} hours"))
+            .bind(limit as i64)
             .fetch_all(pool)
             .await?
+        }
+        (None, Some(s)) => {
+            sqlx::query_as::<_, ScrapeRow>(
+                "SELECT id, model_name, model_created, model_load_id, scraped_at, context_max, \
+                 tasks_processing, tasks_queued, tasks_completed, tasks_duration_s, \
+                 prompt_tokens_total, prompt_tokens_cached, prompt_tokens_processed, \
+                 prediction_tokens_total, prediction_tokens_processed, decode_total, \
+                 kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
+                 FROM v_scrape_summary \
+                 WHERE scraped_at > ? \
+                 ORDER BY scraped_at DESC LIMIT ?"
+            )
+            .bind(s)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, None) => {
+            sqlx::query_as::<_, ScrapeRow>(
+                "SELECT id, model_name, model_created, model_load_id, scraped_at, context_max, \
+                 tasks_processing, tasks_queued, tasks_completed, tasks_duration_s, \
+                 prompt_tokens_total, prompt_tokens_cached, prompt_tokens_processed, \
+                 prediction_tokens_total, prediction_tokens_processed, decode_total, \
+                 kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
+                 FROM v_scrape_summary \
+                 WHERE scraped_at >= unixepoch('now', ?) \
+                 ORDER BY scraped_at DESC LIMIT ?"
+            )
+            .bind(&format!("-{hours} hours"))
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await?
+        }
     };
     Ok(rows)
 }

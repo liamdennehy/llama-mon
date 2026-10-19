@@ -21,6 +21,14 @@ pub async fn health() -> &'static str {
     "OK"
 }
 
+/// Status response with cumulative counters and the latest model loads.
+/// Consolidates what was previously two separate calls (/stats/summary + /models).
+#[derive(Debug, Serialize)]
+pub struct StatusResponse {
+    pub summary: SummaryResponse,
+    pub model_loads: Vec<db::model_load::ModelLoadRow>,
+}
+
 // ── Shared query parameters ──────────────────────────────────
 
 /// Common time-range filter.
@@ -55,6 +63,9 @@ pub struct PageQuery {
     /// Time range. One of: 1h, 6h, 24h, 7d. Default: 24h.
     #[serde(default)]
     pub time_range: TimeRange,
+    /// Only return rows with `scraped_at` / `captured_at` strictly after this Unix epoch second.
+    /// Used by the dashboard to fetch incremental updates on each auto-refresh.
+    pub since: Option<i64>,
 }
 
 fn default_limit() -> usize {
@@ -90,6 +101,33 @@ pub async fn api_summary(
     }))
 }
 
+/// GET /api/status — consolidated status with summary + latest model loads.
+pub async fn api_status(
+    State(pool): State<SqlitePool>,
+) -> Result<Json<StatusResponse>, (StatusCode, String)> {
+    let stats = db::scrape::get_global_stats(&pool).await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to fetch global stats");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+
+    let model_loads = db::model_load::get_all(&pool).await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to fetch model loads");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+
+    Ok(Json(StatusResponse {
+        summary: SummaryResponse {
+            total_scrapes: stats.total_scrapes,
+            total_tasks: stats.total_tasks,
+            total_model_loads: stats.total_model_loads,
+            total_reloads: stats.total_reloads,
+        },
+        model_loads,
+    }))
+}
+
 // ── GET /api/models ──────────────────────────────────────────
 
 /// Return the full model load inventory.
@@ -111,7 +149,7 @@ pub async fn api_scrapes(
     State(pool): State<SqlitePool>,
     params: Query<PageQuery>,
 ) -> Result<Json<Vec<db::scrape::ScrapeRow>>, (StatusCode, String)> {
-    let scrapes = db::scrape::get_recent(&pool, params.limit, params.time_range.hours(), params.model.as_deref())
+    let scrapes = db::scrape::get_recent(&pool, params.limit, params.time_range.hours(), params.model.as_deref(), params.since)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, model = ?params.model, limit = params.limit, time_range = ?params.time_range, "Failed to fetch scrapes");
@@ -127,7 +165,7 @@ pub async fn api_tasks(
     State(pool): State<SqlitePool>,
     params: Query<PageQuery>,
 ) -> Result<Json<Vec<db::task::TaskRow>>, (StatusCode, String)> {
-    let tasks = db::task::get_recent(&pool, params.limit, params.time_range.hours(), params.model.as_deref())
+    let tasks = db::task::get_recent(&pool, params.limit, params.time_range.hours(), params.model.as_deref(), params.since)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, model = ?params.model, limit = params.limit, time_range = ?params.time_range, "Failed to fetch tasks");

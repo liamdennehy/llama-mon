@@ -38,7 +38,9 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(static_files::serve_dashboard))
+        .route("/app.js", get(static_files::serve_app_js))
         .route("/health", get(handlers::health))
+        .route("/api/status", get(handlers::api_status))
         .route("/api/stats/summary", get(handlers::api_summary))
         .route("/api/models", get(handlers::api_models))
         .route("/api/scrapes", get(handlers::api_scrapes))

@@ -226,48 +226,78 @@ mod tests {
 
 // ── Dashboard query helpers ──────────────────────────────────
 
-/// Fetch recent tasks, optionally filtered by model name.
+/// Fetch recent tasks, optionally filtered by model name and/or a `since` timestamp.
 /// Uses the `v_task_summary` view to avoid repeating the JOIN.
 pub async fn get_recent(
     pool: &SqlitePool,
     limit: usize,
     hours: u64,
     model_name: Option<&str>,
+    since: Option<i64>,
 ) -> Result<Vec<TaskRow>, DbError> {
-    let sql = match model_name {
-        Some(_name) => format!(
-            "SELECT task_id, model_name, slot_id, n_prompt_cached, \
-             n_prompt_processed, prompt_ms, prompt_tps, prompt_per_token_ms, \
-             n_gen, gen_ms, gen_tps, gen_per_token_ms, \
-             n_draft_tokens, n_draft_accepted, captured_at \
-             FROM v_task_summary \
-             WHERE model_name = ? AND captured_at >= unixepoch('now', ?) \
-             ORDER BY captured_at DESC LIMIT {}",
-            limit
-        ),
-        None => format!(
-            "SELECT task_id, model_name, slot_id, n_prompt_cached, \
-             n_prompt_processed, prompt_ms, prompt_tps, prompt_per_token_ms, \
-             n_gen, gen_ms, gen_tps, gen_per_token_ms, \
-             n_draft_tokens, n_draft_accepted, captured_at \
-             FROM v_task_summary \
-             WHERE captured_at >= unixepoch('now', ?) \
-             ORDER BY captured_at DESC LIMIT {}",
-            limit
-        ),
-    };
-
-    let rows: Vec<TaskRow> = if let Some(name) = model_name {
-        sqlx::query_as::<_, TaskRow>(&sql)
+    let rows: Vec<TaskRow> = match (model_name, since) {
+        (Some(name), Some(s)) => {
+            sqlx::query_as::<_, TaskRow>(
+                "SELECT task_id, model_name, slot_id, n_prompt_cached, \
+                 n_prompt_processed, prompt_ms, prompt_tps, prompt_per_token_ms, \
+                 n_gen, gen_ms, gen_tps, gen_per_token_ms, \
+                 n_draft_tokens, n_draft_accepted, captured_at \
+                 FROM v_task_summary \
+                 WHERE model_name = ? AND captured_at > ? \
+                 ORDER BY captured_at DESC LIMIT ?"
+            )
             .bind(name)
-            .bind(format!("-{hours} hours"))
+            .bind(s)
+            .bind(limit as i64)
             .fetch_all(pool)
             .await?
-    } else {
-        sqlx::query_as::<_, TaskRow>(&sql)
-            .bind(format!("-{hours} hours"))
+        }
+        (Some(name), None) => {
+            sqlx::query_as::<_, TaskRow>(
+                "SELECT task_id, model_name, slot_id, n_prompt_cached, \
+                 n_prompt_processed, prompt_ms, prompt_tps, prompt_per_token_ms, \
+                 n_gen, gen_ms, gen_tps, gen_per_token_ms, \
+                 n_draft_tokens, n_draft_accepted, captured_at \
+                 FROM v_task_summary \
+                 WHERE model_name = ? AND captured_at >= unixepoch('now', ?) \
+                 ORDER BY captured_at DESC LIMIT ?"
+            )
+            .bind(name)
+            .bind(&format!("-{hours} hours"))
+            .bind(limit as i64)
             .fetch_all(pool)
             .await?
+        }
+        (None, Some(s)) => {
+            sqlx::query_as::<_, TaskRow>(
+                "SELECT task_id, model_name, slot_id, n_prompt_cached, \
+                 n_prompt_processed, prompt_ms, prompt_tps, prompt_per_token_ms, \
+                 n_gen, gen_ms, gen_tps, gen_per_token_ms, \
+                 n_draft_tokens, n_draft_accepted, captured_at \
+                 FROM v_task_summary \
+                 WHERE captured_at > ? \
+                 ORDER BY captured_at DESC LIMIT ?"
+            )
+            .bind(s)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, None) => {
+            sqlx::query_as::<_, TaskRow>(
+                "SELECT task_id, model_name, slot_id, n_prompt_cached, \
+                 n_prompt_processed, prompt_ms, prompt_tps, prompt_per_token_ms, \
+                 n_gen, gen_ms, gen_tps, gen_per_token_ms, \
+                 n_draft_tokens, n_draft_accepted, captured_at \
+                 FROM v_task_summary \
+                 WHERE captured_at >= unixepoch('now', ?) \
+                 ORDER BY captured_at DESC LIMIT ?"
+            )
+            .bind(&format!("-{hours} hours"))
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await?
+        }
     };
     Ok(rows)
 }
