@@ -86,6 +86,7 @@ tr:hover td { background: var(--bg-hover); }
     </select>
     <button id="refreshBtn" title="Refresh now">↻ Refresh</button>
     <button id="exportBtn" title="Export scrapes to CSV">↓ CSV</button>
+    <button id="fetchAllBtn" title="Fetch all records (disable incremental updates)">⊞ Fetch All</button>
     <button id="themeBtn" title="Toggle theme">🌙</button>
   </div>
 </header>
@@ -103,7 +104,6 @@ tr:hover td { background: var(--bg-hover); }
   <div class="chart-card"><h3>Tasks Completed</h3><canvas id="chartScrapes"></canvas></div>
   <div class="chart-card"><h3>Gen TPS</h3><canvas id="chartTps"></canvas></div>
   <div class="chart-card"><h3>Gen Latency (ms/token)</h3><canvas id="chartLatency"></canvas></div>
-  <div class="chart-card"><h3>Memory (GB)</h3><canvas id="chartMemory"></canvas></div>
   <div class="chart-card bubble-card">
     <h3>
       Throughput vs Context Length
@@ -119,7 +119,7 @@ tr:hover td { background: var(--bg-hover); }
 <div class="card" style="margin-bottom:1rem;">
   <h3 style="margin-bottom:0.5rem;">Models</h3>
   <div class="scroll"><table><thead><tr>
-    <th>Name</th><th>Status</th><th>Created</th><th>Scrapes</th><th>Context</th>
+    <th>Name</th><th>Status</th><th>Created</th><th>Scrapes</th><th>Context</th><th>Memory</th>
   </tr></thead><tbody id="modelsBody"></tbody></table></div>
 </div>
 

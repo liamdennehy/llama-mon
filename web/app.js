@@ -2,6 +2,7 @@
 const charts = {};
 let summary = null, models = [], scrapes = [], tasks = [];
 let autoRefresh = true;
+let fetchAll = false;
 let refreshTimer = null;
 // Track the most recent scrape/task timestamps for incremental updates
 let lastScrapeAt = 0, lastTaskAt = 0;
@@ -25,6 +26,15 @@ document.getElementById('themeBtn').addEventListener('click', () => {
 initTheme();
 
 // ── Helpers ──────────────────────────────────────────────────
+function formatBytes(bytes, decimals = 1) {
+  if (!bytes || bytes === 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  // No decimal places for Bytes; use 1 for all others
+  const dec = i === 0 ? 0 : decimals;
+  return (bytes / Math.pow(1024, i)).toFixed(dec) + ' ' + units[i];
+}
+
 function showError(msg) {
   const banner = document.getElementById('errorBanner');
   banner.textContent = msg;
@@ -41,6 +51,24 @@ function esc(s) {
   return d.innerHTML;
 }
 
+// ── Incremental merge helpers ──────────────────────────────────
+function mergeRecords(existing, newRecords, keyField) {
+  const existingMap = new Map(existing.map(r => [r[keyField], r]));
+  for (const rec of newRecords) {
+    existingMap.set(rec[keyField], rec);
+  }
+  // Return sorted by the timestamp field for chronological order
+  return [...existingMap.values()];
+}
+
+function mergeScrapes(existing, newScrapes) {
+  return mergeRecords(existing, newScrapes, 'id');
+}
+
+function mergeTasks(existing, newTasks) {
+  return mergeRecords(existing, newTasks, 'task_id');
+}
+
 // ── Data fetching ────────────────────────────────────────────
 async function fetchData() {
   const range = document.getElementById('timeRange').value;
@@ -49,8 +77,8 @@ async function fetchData() {
   const rangeMap = { '1h': 'H1', '6h': 'H6', '24h': 'H24', '7d': 'D7' };
   const params = new URLSearchParams({ time_range: rangeMap[range] || 'H24', limit: 200 });
   if (model) params.set('model', model);
-  // Only use 'since' on non-initial refreshes (when we have data to compare against)
-  if (lastScrapeAt > 0) {
+  // Only use 'since' on non-initial, non-full-refreshes
+  if (lastScrapeAt > 0 && !fetchAll) {
     params.set('since', String(lastScrapeAt));
   }
 
@@ -64,14 +92,27 @@ async function fetchData() {
     const status = await statusRes.json();
     summary = status.summary;
     models = status.model_loads;
-    [scrapes, tasks] = await Promise.all([scRes.json(), tRes.json()]);
-    // Update last-seen timestamps for incremental fetches
-    if (scrapes.length > 0) {
-      lastScrapeAt = Math.max(lastScrapeAt, ...scrapes.map(s => s.scraped_at));
+    const [newScrapes, newTasks] = await Promise.all([scRes.json(), tRes.json()]);
+
+    if (fetchAll) {
+      // One-shot full fetch: replace everything, reset timestamps
+      scrapes = newScrapes;
+      tasks = newTasks;
+      lastScrapeAt = newScrapes.length > 0 ? Math.max(...newScrapes.map(s => s.scraped_at)) : 0;
+      lastTaskAt = newTasks.length > 0 ? Math.max(...newTasks.map(t => t.captured_at)) : 0;
+    } else {
+      // Incremental: merge new records onto existing
+      scrapes = mergeScrapes(scrapes, newScrapes);
+      tasks = mergeTasks(tasks, newTasks);
+      // Update last-seen timestamps if we got new data
+      if (newScrapes.length > 0) {
+        lastScrapeAt = Math.max(lastScrapeAt, ...newScrapes.map(s => s.scraped_at));
+      }
+      if (newTasks.length > 0) {
+        lastTaskAt = Math.max(lastTaskAt, ...newTasks.map(t => t.captured_at));
+      }
     }
-    if (tasks.length > 0) {
-      lastTaskAt = Math.max(lastTaskAt, ...tasks.map(t => t.captured_at));
-    }
+
     hideError();
     document.getElementById('status').textContent = 'Updated ' + new Date().toLocaleTimeString();
   } catch (e) {
@@ -92,13 +133,15 @@ function render() {
   const mb = document.getElementById('modelsBody');
   const filterModel = document.getElementById('modelFilter').value;
   const filteredModels = filterModel ? models.filter(m => m.model_name === filterModel) : models;
-  mb.innerHTML = filteredModels.map(m =>
-    `<tr><td>${esc(m.model_name)}</td>` +
+  mb.innerHTML = filteredModels.map(m => {
+    const totalMem = (m.context_bytes || 0) + (m.model_bytes || 0);
+    return `<tr><td>${esc(m.model_name)}</td>` +
     `<td class="${m.status==='loaded'?'status-loaded':'status-unloaded'}">${m.status}</td>` +
     `<td>${new Date(m.created*1000).toLocaleString()}</td>` +
     `<td>${m.scrape_count}</td>` +
-    `<td>${m.ctx_size ? m.ctx_size.toLocaleString() : '—'}</td></tr>`
-  ).join('');
+    `<td>${m.ctx_size ? m.ctx_size.toLocaleString() : '—'}</td>` +
+    `<td>${formatBytes(totalMem)}</td></tr>`;
+  }).join('');
 
   const tb = document.getElementById('tasksBody');
   document.getElementById('taskCount').textContent = `(${tasks.length} shown)`;
@@ -159,16 +202,6 @@ function renderCharts() {
     type: 'scatter',
     data: { datasets: [{ label: 'Gen ms/token', data: labels.slice(0, tasksSlice.length).map((l,i) => ({x:l, y:tasksSlice[i].gen_per_token_ms})),
               backgroundColor: '#d29922', pointRadius: 1.5 }] },
-    options: chartOpts
-  });
-
-  // Memory
-  if (charts.chartMemory) charts.chartMemory.destroy();
-  charts.chartMemory = new Chart(document.getElementById('chartMemory'), {
-    type: 'line',
-    data: { labels, datasets: [{ label: 'Memory', data: scrapes.map(s => +(((s.memory_context_bytes||0)+(s.memory_model_bytes||0))/1e9).toFixed(2)),
-              borderColor: '#f85149', fill: true, backgroundColor: '#f85149'+fillOpacity,
-              tension: 0.3, pointRadius: 1 }] },
     options: chartOpts
   });
 
@@ -263,8 +296,24 @@ document.getElementById('autoRefreshBtn').addEventListener('click', function() {
 function startAutoRefresh() { stopAutoRefresh(); refreshTimer = setInterval(fetchData, 30000); }
 function stopAutoRefresh() { if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; } }
 
-document.getElementById('timeRange').addEventListener('change', fetchData);
-document.getElementById('modelFilter').addEventListener('change', fetchData);
+document.getElementById('fetchAllBtn').addEventListener('click', () => {
+  fetchAll = !fetchAll;
+  document.getElementById('fetchAllBtn').classList.toggle('active', fetchAll);
+  fetchData();
+});
+
+// Changing time range or model filter invalidates the incremental baseline —
+// reset timestamps so the next fetch gets a full dataset for the new scope.
+document.getElementById('timeRange').addEventListener('change', () => {
+  lastScrapeAt = 0;
+  lastTaskAt = 0;
+  fetchData();
+});
+document.getElementById('modelFilter').addEventListener('change', () => {
+  lastScrapeAt = 0;
+  lastTaskAt = 0;
+  fetchData();
+});
 document.getElementById('tpsMetric')?.addEventListener('change', () => requestAnimationFrame(() => renderCharts()));
 
 // ── Init ─────────────────────────────────────────────────────

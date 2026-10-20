@@ -359,8 +359,14 @@ pub async fn get_recent(
 
 /// Compute global cumulative stats from the database.
 pub async fn get_global_stats(pool: &SqlitePool) -> Result<ScrapeStats, DbError> {
-    let stats: (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(MAX(tasks_completed), 0), COUNT(DISTINCT model_name), COUNT(*) FROM scrapes"
+    let stats: (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(MAX(tasks_completed), 0), COUNT(DISTINCT model_name) FROM scrapes"
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let model_loads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM model_loads"
     )
     .fetch_one(pool)
     .await?;
@@ -374,7 +380,7 @@ pub async fn get_global_stats(pool: &SqlitePool) -> Result<ScrapeStats, DbError>
     Ok(ScrapeStats {
         total_scrapes: stats.0 as u64,
         total_tasks: stats.1 as u64,
-        total_model_loads: stats.3 as u64,
+        total_model_loads: model_loads as u64,
         total_poll_cycles: stats.0 as u64, // scrapes ~= poll cycles (one scrape per cycle)
         total_reloads: reloads as u64,
     })

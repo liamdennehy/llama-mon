@@ -213,28 +213,43 @@ impl Poller {
         &mut self,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<(), PollerError> {
+        let poll_duration = self.config.poll_duration();
         loop {
+            // Check for shutdown before polling
+            if shutdown_rx.try_recv().is_ok() {
+                tracing::info!("Shutdown signal received");
+                tracing::info!(
+                    total_scrapes = self.stats.total_scrapes,
+                    total_tasks = self.stats.total_tasks,
+                    total_model_loads = self.stats.total_model_loads,
+                    total_reloads = self.stats.total_reloads,
+                    "Graceful shutdown"
+                );
+                if let Err(e) = db::wal_checkpoint(&self.pool).await {
+                    tracing::warn!(error = %e, "Failed to checkpoint WAL on shutdown");
+                }
+                return Err(PollerError::Stopped);
+            }
+
+            match self.poll_cycle().await {
+                Ok(_) => {} // Cycle complete
+                Err(e) => tracing::error!(error = %e, "Poll cycle failed"),
+            }
+
+            // Sleep for the poll interval, but check shutdown during the wait
+            let sleep_fut = tokio::time::sleep(poll_duration);
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    tracing::info!("Shutdown signal received");
-                    tracing::info!(
-                        total_scrapes = self.stats.total_scrapes,
-                        total_tasks = self.stats.total_tasks,
-                        total_model_loads = self.stats.total_model_loads,
-                        total_reloads = self.stats.total_reloads,
-                        "Graceful shutdown"
-                    );
+                    tracing::info!("Shutdown signal received during sleep");
                     if let Err(e) = db::wal_checkpoint(&self.pool).await {
                         tracing::warn!(error = %e, "Failed to checkpoint WAL on shutdown");
                     }
                     return Err(PollerError::Stopped);
                 }
-                _ = self.poll_cycle() => {
-                    // Cycle complete
+                _ = sleep_fut => {
+                    // Sleep expired — loop back to the next poll cycle
                 }
             }
-
-            tokio::time::sleep(self.config.poll_duration()).await;
         }
     }
 
@@ -395,8 +410,10 @@ impl Poller {
                         });
 
                     let new_created = entry.created + 1;
-                    let new_load_id = model_load::upsert(&self.pool, &model_load_to_insert(&load, &entry)).await?;
-                    new_loads += 1;
+                    let (new_load_id, was_new) = model_load::upsert(&self.pool, &model_load_to_insert(&load, &entry)).await?;
+                    if was_new {
+                        new_loads += 1;
+                    }
 
                     let mut scrape_insert: db::scrape::ScrapeInsert =
                         (full_metrics, now).into();

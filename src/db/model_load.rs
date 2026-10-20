@@ -77,11 +77,12 @@ pub struct ModelLoadInsert<'a> {
     pub swa_checkpoints: Option<i64>,
 }
 
-/// Upsert a model load. Returns the existing or newly inserted id.
+/// Upsert a model load. Returns `(id, was_new)` — the row id and whether
+/// a new row was inserted (true) or an existing row was updated (false).
 pub async fn upsert(
     pool: &SqlitePool,
     ml: &ModelLoadInsert<'_>,
-) -> Result<i64, DbError> {
+) -> Result<(i64, bool), DbError> {
     let existing = sqlx::query_scalar::<_, i64>(
         "SELECT id FROM model_loads WHERE model_name = ? AND created = ?"
     )
@@ -135,7 +136,7 @@ pub async fn upsert(
         .bind(id)
         .execute(pool)
         .await?;
-        Ok(id)
+        Ok((id, false))
     } else {
         let id = sqlx::query_scalar(
             r#"INSERT INTO model_loads (
@@ -183,7 +184,7 @@ pub async fn upsert(
         .bind(ml.swa_checkpoints)
         .fetch_one(pool)
         .await?;
-        Ok(id)
+        Ok((id, true))
     }
 }
 
@@ -320,8 +321,9 @@ mod tests {
             spec_type: None,
             swa_checkpoints: None,
         };
-        let id = upsert(&pool, &insert).await.unwrap();
+        let (id, was_new) = upsert(&pool, &insert).await.unwrap();
         assert!(id > 0);
+        assert!(was_new);
     }
 
     #[tokio::test]
@@ -385,7 +387,7 @@ mod tests {
             reasoning_format: None, spec_draft_n_max: None, spec_type: None,
             swa_checkpoints: None,
         };
-        let id = upsert(&pool, &insert).await.unwrap();
+        let (id, was_new) = upsert(&pool, &insert).await.unwrap();
 
         let row = get_by_id(&pool, id).await.unwrap().unwrap();
         assert_eq!(row.id, id);

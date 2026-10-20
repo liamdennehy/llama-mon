@@ -11,4 +11,5 @@ pub mod models_api;
 pub mod parse;
 pub mod poller;
 pub mod preset;
+pub mod signals;
 pub mod web;

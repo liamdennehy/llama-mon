@@ -46,8 +46,41 @@ pub type ServerList = Vec<ServerConfig>;
 ///
 /// Loaded from `.env` file (auto-discovered), CLI arguments, and
 /// environment variables. CLI args override env vars which override defaults.
+/// Verbosity level for log output.
+///
+/// These are mutually exclusive — clap will enforce this via `ArgGroup`.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum Verbosity {
+    // Silent: no log output at all
+    Silent,
+    // Quiet: error and critical only
+    Quiet,
+    // Default: warn and above
+    #[default]
+    Default,
+    // Verbose: info and above
+    Verbose,
+    // Debug: debug and above
+    Debug,
+}
+
+impl Verbosity {
+    /// Convert the verbosity level to a tracing `EnvFilter` directive string.
+    /// Returns `None` if this level produces no output.
+    pub fn filter_directive(&self) -> Option<&'static str> {
+        Some(match self {
+            Verbosity::Silent => return None,
+            Verbosity::Quiet => "error",
+            Verbosity::Default => "warn",
+            Verbosity::Verbose => "info",
+            Verbosity::Debug => "debug",
+        })
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "llama-mon", about = "llama.cpp inference server metrics monitor", version)]
+
 #[derive(Clone)]
 pub struct Config {
     /// URL or host:port of a llama-server instance to monitor.
@@ -72,9 +105,21 @@ pub struct Config {
     #[arg(long = "timeout", env = "LLAMA_MON_TIMEOUT", default_value = "10s")]
     pub timeout: humantime::Duration,
 
-    /// Enable verbose logging
-    #[arg(long = "verbose", env = "LLAMA_MON_VERBOSE")]
+    /// No log output at all
+    #[arg(long = "silent", group = "verbosity", conflicts_with_all = &["quiet", "verbose", "debug"])]
+    pub silent: bool,
+
+    /// Only log errors and critical messages
+    #[arg(long = "quiet", group = "verbosity", conflicts_with_all = &["silent", "verbose", "debug"])]
+    pub quiet: bool,
+
+    /// Include info-level logs
+    #[arg(long = "verbose", short = 'v', group = "verbosity", conflicts_with_all = &["silent", "quiet", "debug"])]
     pub verbose: bool,
+
+    /// Include debug-level logs
+    #[arg(long = "debug", group = "verbosity", conflicts_with_all = &["silent", "quiet", "verbose"])]
+    pub debug: bool,
 
     /// Filter by model name(s). If omitted, all models are scraped.
     /// Can be specified multiple times: --model foo --model bar
@@ -144,7 +189,10 @@ impl Config {
             poll_interval: config.poll_interval,
             db_path: config.db_path,
             timeout: config.timeout,
+            silent: config.silent,
+            quiet: config.quiet,
             verbose: config.verbose,
+            debug: config.debug,
             models: config.models,
             fail_fast: config.fail_fast,
             listen_ip: config.listen_ip,
@@ -227,6 +275,17 @@ impl Config {
         !self.servers.is_empty()
     }
 
+    /// Resolve the configured verbosity level from the CLI flags.
+    pub fn verbosity(&self) -> Verbosity {
+        match (self.silent, self.quiet, self.verbose, self.debug) {
+            (true, _, _, _) => Verbosity::Silent,
+            (_, true, _, _) => Verbosity::Quiet,
+            (_, _, _, true) => Verbosity::Debug,
+            (_, _, true, _) => Verbosity::Verbose,
+            _ => Verbosity::Default,
+        }
+    }
+
     /// Whether the web dashboard server should run.
     /// Returns `true` if `--port` is set to a value > 0.
     pub fn should_serve_web(&self) -> bool {
@@ -261,7 +320,10 @@ mod tests {
             poll_interval: humantime::Duration::from(std::time::Duration::from_secs(5)),
             db_path: PathBuf::from("/tmp/llama-mon-test.db"),
             timeout: humantime::Duration::from(std::time::Duration::from_secs(10)),
+            silent: false,
+            quiet: false,
             verbose: false,
+            debug: false,
             models: vec![],
             fail_fast: false,
             listen_ip: "127.0.0.1".to_string(),
@@ -277,7 +339,10 @@ mod tests {
             poll_interval: humantime::Duration::from(std::time::Duration::from_secs(5)),
             db_path: PathBuf::from("/tmp/llama-mon-test.db"),
             timeout: humantime::Duration::from(std::time::Duration::from_secs(10)),
+            silent: false,
+            quiet: false,
             verbose: false,
+            debug: false,
             models: vec![],
             fail_fast: false,
             listen_ip: "127.0.0.1".to_string(),
