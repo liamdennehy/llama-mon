@@ -7,6 +7,10 @@ edition = "2024"
 name = "llama-mon"
 path = "src/main.rs"
 
+[features]
+default = []
+dev = []
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "time"] }
 reqwest = { version = "0.12", features = ["json"] }
