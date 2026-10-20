@@ -231,8 +231,26 @@ impl Poller {
                 return Err(PollerError::Stopped);
             }
 
-            match self.poll_cycle().await {
+            // Run poll_cycle interruptible by shutdown — if the signal arrives
+            // while poll_cycle is in-flight (e.g. during an HTTP request), the
+            // select! ensures we bail out immediately instead of waiting for the
+            // entire cycle to complete.
+            let cycle_result = tokio::select! {
+                result = self.poll_cycle() => result,
+                _ = shutdown_rx.recv() => {
+                    tracing::info!("Shutdown signal received during poll cycle");
+                    Err(PollerError::Stopped)
+                }
+            };
+
+            match cycle_result {
                 Ok(_) => {} // Cycle complete
+                Err(PollerError::Stopped) => {
+                    if let Err(e) = db::wal_checkpoint(&self.pool).await {
+                        tracing::warn!(error = %e, "Failed to checkpoint WAL on shutdown");
+                    }
+                    return Err(PollerError::Stopped);
+                }
                 Err(e) => tracing::error!(error = %e, "Poll cycle failed"),
             }
 

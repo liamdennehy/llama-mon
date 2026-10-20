@@ -135,15 +135,19 @@ async fn main() -> Result<()> {
     };
 
     // Reactor loop — checks the signal flag at well-defined boundaries.
-    loop {
-        let mut got_shutdown = false;
+    // The signal handler thread sets the atomic flag on signal arrival; this
+    // loop polls it between await points to stay responsive.
+    'reactor_loop: loop {
+        // Drain all pending signals.
         let mut got_sigusr1 = false;
-
-        // Check signals before each reactor iteration.
-        // We check between pollers so the loop is responsive.
         loop {
             match signal_flag.take() {
-                Some(1) => got_shutdown = true,
+                Some(1) => {
+                    // Shutdown — send broadcast and exit immediately
+                    tracing::info!("Shutdown signal received");
+                    let _ = shutdown_tx.send(());
+                    break 'reactor_loop;
+                }
                 Some(2) => got_sigusr1 = true,
                 None => break,
                 _ => {}
@@ -154,46 +158,28 @@ async fn main() -> Result<()> {
             dump_model_state(&pool).await;
         }
 
-        if got_shutdown {
-            tracing::info!("Shutdown signal received");
-            let _ = shutdown_tx.send(());
-            break;
-        }
-
-        // Wait for any active component to finish.
-        // When both are active, we wait for all pollers (they drive the lifecycle);
-        // when only the web server runs, we wait for it.
         let any_active = !poll_handles.is_empty() || web_handle.is_some();
         if !any_active {
             break;
         }
 
         if !poll_handles.is_empty() {
-            // Check if any poller has already exited
-            let mut all_done = true;
-            for h in &poll_handles {
-                if !h.is_finished() {
-                    all_done = false;
-                    break;
-                }
-            }
-
-            if !all_done {
-                // At least one poller is still running — wait for the next one to finish
+            // Check if any poller is still running
+            if poll_handles.iter().any(|h| !h.is_finished()) {
+                // Wait for all pollers (they will receive the shutdown signal
+                // and exit gracefully)
                 for h in poll_handles {
                     let result = h.await?;
                     if let Err(e) = result {
                         tracing::error!(error = %e, "Poller stopped");
                     }
                 }
-                // All pollers finished — shut down the web server if running
                 if let Some(h) = web_handle {
                     let _ = h.await;
                 }
                 break;
             }
         } else if let Some(h) = web_handle {
-            // Only web server running — wait for it
             let _ = h.await;
             break;
         } else {

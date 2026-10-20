@@ -104,6 +104,7 @@ tr:hover td { background: var(--bg-hover); }
   <div class="chart-card"><h3>Tasks Completed</h3><canvas id="chartScrapes"></canvas></div>
   <div class="chart-card"><h3>Gen TPS</h3><canvas id="chartTps"></canvas></div>
   <div class="chart-card"><h3>Gen Latency (ms/token)</h3><canvas id="chartLatency"></canvas></div>
+  <div class="chart-card"><h3>Context Misses (log scale)</h3><canvas id="chartCacheMiss"></canvas></div>
   <div class="chart-card bubble-card">
     <h3>
       Throughput vs Context Length
@@ -119,7 +120,7 @@ tr:hover td { background: var(--bg-hover); }
 <div class="card" style="margin-bottom:1rem;">
   <h3 style="margin-bottom:0.5rem;">Models</h3>
   <div class="scroll"><table><thead><tr>
-    <th>Name</th><th>Status</th><th>Created</th><th>Scrapes</th><th>Context</th><th>Memory</th>
+    <th>Name</th><th>Status</th><th>Created</th><th>Scrapes</th><th>Context Tokens</th><th>Model (V)RAM</th>
   </tr></thead><tbody id="modelsBody"></tbody></table></div>
 </div>
 
@@ -127,7 +128,7 @@ tr:hover td { background: var(--bg-hover); }
   <h3 style="margin-bottom:0.5rem;">Recent Tasks <span id="taskCount" style="font-weight:400;font-size:0.75rem;color:var(--text-muted);"></span></h3>
   <div class="scroll"><table><thead><tr>
     <th>ID</th><th>Model</th><th>Slot</th><th>Gen</th><th>Gen TPS</th>
-    <th>Gen ms/t</th><th>Prompt</th><th>Prompt TPS</th><th>Captured</th>
+    <th>Gen ms/t</th><th>Prompt</th><th>Prompt TPS</th><th>KV Cache</th><th>Captured</th>
   </tr></thead><tbody id="tasksBody"></tbody></table></div>
 </div>
 

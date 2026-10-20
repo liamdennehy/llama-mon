@@ -134,24 +134,29 @@ function render() {
   const filterModel = document.getElementById('modelFilter').value;
   const filteredModels = filterModel ? models.filter(m => m.model_name === filterModel) : models;
   mb.innerHTML = filteredModels.map(m => {
-    const totalMem = (m.context_bytes || 0) + (m.model_bytes || 0);
+    const ctxVram = m.cache_ram || 0;
+    const modelVram = m.model_bytes || 0;
+    const totalVram = ctxVram + modelVram;
     return `<tr><td>${esc(m.model_name)}</td>` +
     `<td class="${m.status==='loaded'?'status-loaded':'status-unloaded'}">${m.status}</td>` +
     `<td>${new Date(m.created*1000).toLocaleString()}</td>` +
-    `<td>${m.scrape_count}</td>` +
+    `<td>${m.scrape_count ?? '—'}</td>` +
     `<td>${m.ctx_size ? m.ctx_size.toLocaleString() : '—'}</td>` +
-    `<td>${formatBytes(totalMem)}</td></tr>`;
+    `<td>${formatBytes(totalVram)}</td></tr>`;
   }).join('');
 
   const tb = document.getElementById('tasksBody');
   document.getElementById('taskCount').textContent = `(${tasks.length} shown)`;
-  tb.innerHTML = tasks.slice(0, 50).map(t =>
-    `<tr><td>${t.task_id}</td><td>${esc(t.model_name)}</td><td>${t.slot_id}</td>` +
+  tb.innerHTML = tasks.slice(0, 50).map(t => {
+    const totalPrompt = t.n_prompt_cached + t.n_prompt_processed;
+    const kvCache = totalPrompt > 0 ? ((t.n_prompt_cached / totalPrompt) * 100).toFixed(1) + '%' : '—';
+    return `<tr><td>${t.task_id}</td><td>${esc(t.model_name)}</td><td>${t.slot_id}</td>` +
     `<td>${t.n_gen}</td><td>${t.gen_tps.toFixed(1)}</td>` +
-    `<td>${t.gen_per_token_ms.toFixed(1)}</td><td>${t.n_prompt_cached+t.n_prompt_processed}</td>` +
+    `<td>${t.gen_per_token_ms.toFixed(1)}</td><td>${totalPrompt}</td>` +
     `<td>${t.prompt_tps.toFixed(1)}</td>` +
-    `<td>${new Date(t.captured_at*1000).toLocaleString()}</td></tr>`
-  ).join('');
+    `<td>${kvCache}</td>` +
+    `<td>${new Date(t.captured_at*1000).toLocaleString()}</td></tr>`;
+  }).join('');
 
   // Defer chart rendering to ensure the browser has painted canvas dimensions.
   // On initial load the DOM layout may not be ready by the time fetchData resolves.
@@ -176,14 +181,33 @@ function renderCharts() {
     }
   };
 
-  // Tasks completed (cumulative)
+  // Task throughput (tasks/min) — compute delta between consecutive scrapes
   if (charts.chartScrapes) charts.chartScrapes.destroy();
+  const throughputData = scrapes.map((s, i) => {
+    const tasks = s.tasks_completed || 0;
+    if (i === 0 || !scrapes[i - 1]) {
+      return { x: s.scraped_at, y: 0 };
+    }
+    const prev = scrapes[i - 1];
+    const dtMin = (s.scraped_at - prev.scraped_at) / 60;
+    const throughput = dtMin > 0 ? (tasks - (prev.tasks_completed || 0)) / dtMin : 0;
+    return { x: s.scraped_at, y: Math.max(0, throughput) };
+  });
+  const throughputLabels = scrapes.map(s => new Date(s.scraped_at * 1000).toLocaleTimeString());
   charts.chartScrapes = new Chart(document.getElementById('chartScrapes'), {
     type: 'line',
-    data: { labels, datasets: [{ label: 'Completed', data: scrapes.map(s => s.tasks_completed),
+    data: { labels: throughputLabels, datasets: [{ label: 'Tasks/min', data: throughputData.map(d => d.y),
               borderColor: '#58a6ff', fill: true, backgroundColor: '#58a6ff'+fillOpacity,
               tension: 0.3, pointRadius: 1 }] },
-    options: chartOpts
+    options: {
+      ...chartOpts,
+      scales: {
+        ...chartOpts.scales,
+        y: { ...chartOpts.scales.y, beginAtZero: true,
+             title: { display: true, text: 'Tasks/min', color: tickColor }
+           }
+      }
+    }
   });
 
   // Gen TPS
@@ -203,6 +227,55 @@ function renderCharts() {
     data: { datasets: [{ label: 'Gen ms/token', data: labels.slice(0, tasksSlice.length).map((l,i) => ({x:l, y:tasksSlice[i].gen_per_token_ms})),
               backgroundColor: '#d29922', pointRadius: 1.5 }] },
     options: chartOpts
+  });
+
+  // Context miss rate (misses/min) — log scale to show detail across wide range
+  // x-axis is linear epoch time, formatted via tick callback
+  if (charts.chartCacheMiss) charts.chartCacheMiss.destroy();
+  const cacheMissData = scrapes.map((s, i) => {
+    const total = s.prompt_tokens_total || 0;
+    const cached = s.prompt_tokens_cached || 0;
+    const misses = Math.max(0, total - cached);
+    if (i === 0 || !scrapes[i - 1]) {
+      return { x: s.scraped_at, y: 0 };
+    }
+    const prev = scrapes[i - 1];
+    const dtMin = (s.scraped_at - prev.scraped_at) / 60;
+    const prevMisses = Math.max(0, (prev.prompt_tokens_total || 0) - (prev.prompt_tokens_cached || 0));
+    const rate = dtMin > 0 ? (misses - prevMisses) / dtMin : 0;
+    return { x: s.scraped_at, y: Math.max(0, rate) };
+  });
+  charts.chartCacheMiss = new Chart(document.getElementById('chartCacheMiss'), {
+    type: 'scatter',
+    data: { datasets: [{ label: 'Miss/min', data: cacheMissData,
+              backgroundColor: '#f85149', pointRadius: 1 }] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: {
+          type: 'linear',
+          min: scrapes.length > 0 ? Math.min(...scrapes.map(s => s.scraped_at)) : 0,
+          max: scrapes.length > 0 ? Math.max(...scrapes.map(s => s.scraped_at)) : 0,
+          ticks: {
+            color: tickColor,
+            maxTicksLimit: 10,
+            callback: function(value) {
+              return new Date(value * 1000).toLocaleTimeString();
+            }
+          },
+          grid: { color: gridColor },
+          title: { display: true, text: 'Time', color: tickColor }
+        },
+        y: {
+          type: 'logarithmic',
+          ticks: { color: tickColor },
+          grid: { color: gridColor },
+          title: { display: true, text: 'Miss/min (log)', color: tickColor }
+        }
+      }
+    }
   });
 
   // Throughput vs Context Length — bubble chart

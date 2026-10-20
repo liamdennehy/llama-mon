@@ -23,10 +23,42 @@ pub async fn health() -> &'static str {
 
 /// Status response with cumulative counters and the latest model loads.
 /// Consolidates what was previously two separate calls (/stats/summary + /models).
+/// Model load row as exposed to the API, augmented with scrape count.
+#[derive(Debug, Serialize)]
+pub struct ModelLoadApiResponse {
+    pub id: i64,
+    pub model_name: String,
+    pub created: i64,
+    pub status: String,
+    pub loaded_at: Option<i64>,
+    pub unloaded_at: Option<i64>,
+    pub ctx_size: Option<i64>,
+    pub cache_ram: Option<i64>,
+    pub model_bytes: Option<i64>,
+    pub scrape_count: i64,
+}
+
+impl From<(db::model_load::ModelLoadRow, i64)> for ModelLoadApiResponse {
+    fn from((row, scrape_count): (db::model_load::ModelLoadRow, i64)) -> Self {
+        Self {
+            id: row.id,
+            model_name: row.model_name,
+            created: row.created,
+            status: row.status,
+            loaded_at: row.loaded_at,
+            unloaded_at: row.unloaded_at,
+            ctx_size: row.ctx_size,
+            cache_ram: row.cache_ram,
+            model_bytes: row.model_bytes,
+            scrape_count,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub summary: SummaryResponse,
-    pub model_loads: Vec<db::model_load::ModelLoadRow>,
+    pub model_loads: Vec<ModelLoadApiResponse>,
 }
 
 // ── Shared query parameters ──────────────────────────────────
@@ -111,11 +143,16 @@ pub async fn api_status(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
-    let model_loads = db::model_load::get_all(&pool).await
+    let model_loads_with_counts = db::model_load::get_all_with_scrape_counts(&pool).await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to fetch model loads");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
+
+    let model_loads: Vec<ModelLoadApiResponse> = model_loads_with_counts
+        .into_iter()
+        .map(ModelLoadApiResponse::from)
+        .collect();
 
     Ok(Json(StatusResponse {
         summary: SummaryResponse {
@@ -133,13 +170,14 @@ pub async fn api_status(
 /// Return the full model load inventory.
 pub async fn api_models(
     State(pool): State<SqlitePool>,
-) -> Result<Json<Vec<db::model_load::ModelLoadRow>>, (StatusCode, String)> {
-    let models = db::model_load::get_all(&pool).await
+) -> Result<Json<Vec<ModelLoadApiResponse>>, (StatusCode, String)> {
+    let model_loads_with_counts = db::model_load::get_all_with_scrape_counts(&pool).await
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to fetch models");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
-    Ok(Json(models))
+
+    Ok(Json(model_loads_with_counts.into_iter().map(ModelLoadApiResponse::from).collect()))
 }
 
 // ── GET /api/scrapes ─────────────────────────────────────────
