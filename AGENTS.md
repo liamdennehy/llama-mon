@@ -25,6 +25,7 @@ llama-mon is a Rust 2024 async daemon that polls a llama.cpp inference server's 
 - All DDL is in `db/schema.rs`; do not write raw SQL strings outside that file
 - Use prepared statements with bind parameters; never interpolate values into SQL
 - WAL mode is required; checkpoint on shutdown
+- Prefer SQL Views over lengthy SELECT statements in the source code
 
 ## HTTP
 

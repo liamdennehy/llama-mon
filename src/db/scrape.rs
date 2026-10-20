@@ -281,7 +281,6 @@ mod tests {
 /// Note: model_load_id is not selected from the view (it's implicit via model_name).
 pub async fn get_recent(
     pool: &SqlitePool,
-    limit: usize,
     hours: u64,
     model_name: Option<&str>,
     since: Option<i64>,
@@ -296,11 +295,10 @@ pub async fn get_recent(
                  kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
                  FROM v_scrape_summary \
                  WHERE model_name = ? AND scraped_at > ? \
-                 ORDER BY scraped_at DESC LIMIT ?"
+                 ORDER BY scraped_at DESC"
             )
             .bind(name)
             .bind(s)
-            .bind(limit as i64)
             .fetch_all(pool)
             .await?
         }
@@ -313,11 +311,10 @@ pub async fn get_recent(
                  kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
                  FROM v_scrape_summary \
                  WHERE model_name = ? AND scraped_at >= unixepoch('now', ?) \
-                 ORDER BY scraped_at DESC LIMIT ?"
+                 ORDER BY scraped_at DESC"
             )
             .bind(name)
             .bind(&format!("-{hours} hours"))
-            .bind(limit as i64)
             .fetch_all(pool)
             .await?
         }
@@ -330,10 +327,9 @@ pub async fn get_recent(
                  kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
                  FROM v_scrape_summary \
                  WHERE scraped_at > ? \
-                 ORDER BY scraped_at DESC LIMIT ?"
+                 ORDER BY scraped_at DESC"
             )
             .bind(s)
-            .bind(limit as i64)
             .fetch_all(pool)
             .await?
         }
@@ -346,10 +342,9 @@ pub async fn get_recent(
                  kvcache_active_tokens, memory_context_bytes, memory_model_bytes, task_ids_seen \
                  FROM v_scrape_summary \
                  WHERE scraped_at >= unixepoch('now', ?) \
-                 ORDER BY scraped_at DESC LIMIT ?"
+                 ORDER BY scraped_at DESC"
             )
             .bind(&format!("-{hours} hours"))
-            .bind(limit as i64)
             .fetch_all(pool)
             .await?
         }

@@ -277,11 +277,12 @@ pub async fn get_all(pool: &SqlitePool) -> Result<Vec<ModelLoadRow>, DbError> {
     Ok(rows)
 }
 
-/// Get all model loads with per-load scrape counts.
-/// The scrape count is derived from a LEFT JOIN on the scrapes table.
+/// Get all model loads with per-load scrape counts and latest scrape metrics.
+/// scrape_count: derived from a LEFT JOIN on the scrapes table.
+/// memory_model_bytes: the latest scrape's memory_model_bytes for this load.
 pub async fn get_all_with_scrape_counts(
     pool: &SqlitePool,
-) -> Result<Vec<(ModelLoadRow, i64)>, DbError> {
+) -> Result<Vec<(ModelLoadRow, i64, Option<i64>)>, DbError> {
     let rows = sqlx::query(
         r#"SELECT ml.id, ml.model_name, ml.created, ml.status, ml.loaded_at, ml.unloaded_at,
                 ml.preset_raw, ml.ctx_size, ml.n_batch, ml.n_ubatch, ml.parallel, ml.threads,
@@ -291,13 +292,23 @@ pub async fn get_all_with_scrape_counts(
                 ml.image_min_tokens, ml.load_mode, ml.op_offload, ml.reasoning,
                 ml.reasoning_budget, ml.reasoning_format, ml.spec_draft_n_max,
                 ml.spec_type, ml.swa_checkpoints,
-                COALESCE(scrape_cnt.scrape_count, 0) AS scrape_count
+                COALESCE(scrape_cnt.scrape_count, 0) AS scrape_count,
+                COALESCE(last_scrape.memory_model_bytes, 0) AS memory_model_bytes
            FROM model_loads ml
            LEFT JOIN (
                SELECT model_load_id, COUNT(*) AS scrape_count
                FROM scrapes
                GROUP BY model_load_id
            ) scrape_cnt ON ml.id = scrape_cnt.model_load_id
+           LEFT JOIN (
+               SELECT model_load_id, memory_model_bytes
+               FROM scrapes
+               WHERE (model_load_id, scraped_at) IN (
+                   SELECT model_load_id, MAX(scraped_at)
+                   FROM scrapes
+                   GROUP BY model_load_id
+               )
+           ) last_scrape ON ml.id = last_scrape.model_load_id
            ORDER BY ml.created DESC"#
     )
     .fetch_all(pool)
@@ -307,7 +318,13 @@ pub async fn get_all_with_scrape_counts(
     for row in rows {
         let ml: ModelLoadRow = sqlx::FromRow::from_row(&row)?;
         let scrape_count: i64 = row.try_get("scrape_count")?;
-        result.push((ml, scrape_count));
+        let memory_model_bytes: Option<i64> = row.try_get("memory_model_bytes")?;
+        // Zero means no scrape data yet — treat as None
+        let memory_model_bytes = match memory_model_bytes {
+            Some(v) if v > 0 => Some(v),
+            _ => None,
+        };
+        result.push((ml, scrape_count, memory_model_bytes));
     }
     Ok(result)
 }

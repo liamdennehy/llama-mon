@@ -23,7 +23,7 @@ pub async fn health() -> &'static str {
 
 /// Status response with cumulative counters and the latest model loads.
 /// Consolidates what was previously two separate calls (/stats/summary + /models).
-/// Model load row as exposed to the API, augmented with scrape count.
+/// Model load row as exposed to the API, augmented with scrape count and VRAM.
 #[derive(Debug, Serialize)]
 pub struct ModelLoadApiResponse {
     pub id: i64,
@@ -33,13 +33,13 @@ pub struct ModelLoadApiResponse {
     pub loaded_at: Option<i64>,
     pub unloaded_at: Option<i64>,
     pub ctx_size: Option<i64>,
-    pub cache_ram: Option<i64>,
-    pub model_bytes: Option<i64>,
+    pub memory_model_bytes: Option<i64>,
     pub scrape_count: i64,
+    pub mtp: bool,
 }
 
-impl From<(db::model_load::ModelLoadRow, i64)> for ModelLoadApiResponse {
-    fn from((row, scrape_count): (db::model_load::ModelLoadRow, i64)) -> Self {
+impl From<(db::model_load::ModelLoadRow, i64, Option<i64>)> for ModelLoadApiResponse {
+    fn from((row, scrape_count, memory_model_bytes): (db::model_load::ModelLoadRow, i64, Option<i64>)) -> Self {
         Self {
             id: row.id,
             model_name: row.model_name,
@@ -48,9 +48,9 @@ impl From<(db::model_load::ModelLoadRow, i64)> for ModelLoadApiResponse {
             loaded_at: row.loaded_at,
             unloaded_at: row.unloaded_at,
             ctx_size: row.ctx_size,
-            cache_ram: row.cache_ram,
-            model_bytes: row.model_bytes,
+            memory_model_bytes,
             scrape_count,
+            mtp: row.spec_type.as_deref() == Some("mtp"),
         }
     }
 }
@@ -87,9 +87,6 @@ impl TimeRange {
 /// Common query params for paginated endpoints.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct PageQuery {
-    /// Max rows to return. Default: 100.
-    #[serde(default = "default_limit")]
-    pub limit: usize,
     /// Filter by model name. Default: all models.
     pub model: Option<String>,
     /// Time range. One of: 1h, 6h, 24h, 7d. Default: 24h.
@@ -98,10 +95,6 @@ pub struct PageQuery {
     /// Only return rows with `scraped_at` / `captured_at` strictly after this Unix epoch second.
     /// Used by the dashboard to fetch incremental updates on each auto-refresh.
     pub since: Option<i64>,
-}
-
-fn default_limit() -> usize {
-    100
 }
 
 // ── GET /api/stats/summary ───────────────────────────────────
@@ -187,10 +180,10 @@ pub async fn api_scrapes(
     State(pool): State<SqlitePool>,
     params: Query<PageQuery>,
 ) -> Result<Json<Vec<db::scrape::ScrapeRow>>, (StatusCode, String)> {
-    let scrapes = db::scrape::get_recent(&pool, params.limit, params.time_range.hours(), params.model.as_deref(), params.since)
+    let scrapes = db::scrape::get_recent(&pool, params.time_range.hours(), params.model.as_deref(), params.since)
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, model = ?params.model, limit = params.limit, time_range = ?params.time_range, "Failed to fetch scrapes");
+            tracing::error!(error = %e, model = ?params.model, time_range = ?params.time_range, "Failed to fetch scrapes");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
     Ok(Json(scrapes))
@@ -198,15 +191,15 @@ pub async fn api_scrapes(
 
 // ── GET /api/tasks ───────────────────────────────────────────
 
-/// Paginated individual task records.
+/// Individual task records.
 pub async fn api_tasks(
     State(pool): State<SqlitePool>,
     params: Query<PageQuery>,
 ) -> Result<Json<Vec<db::task::TaskRow>>, (StatusCode, String)> {
-    let tasks = db::task::get_recent(&pool, params.limit, params.time_range.hours(), params.model.as_deref(), params.since)
+    let tasks = db::task::get_recent(&pool, params.time_range.hours(), params.model.as_deref(), params.since)
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, model = ?params.model, limit = params.limit, time_range = ?params.time_range, "Failed to fetch tasks");
+            tracing::error!(error = %e, model = ?params.model, time_range = ?params.time_range, "Failed to fetch tasks");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
     Ok(Json(tasks))

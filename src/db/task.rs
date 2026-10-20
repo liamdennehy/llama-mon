@@ -230,7 +230,6 @@ mod tests {
 /// Uses the `v_task_summary` view to avoid repeating the JOIN.
 pub async fn get_recent(
     pool: &SqlitePool,
-    limit: usize,
     hours: u64,
     model_name: Option<&str>,
     since: Option<i64>,
@@ -244,11 +243,10 @@ pub async fn get_recent(
                  n_draft_tokens, n_draft_accepted, captured_at \
                  FROM v_task_summary \
                  WHERE model_name = ? AND captured_at > ? \
-                 ORDER BY captured_at DESC LIMIT ?"
+                 ORDER BY captured_at DESC"
             )
             .bind(name)
             .bind(s)
-            .bind(limit as i64)
             .fetch_all(pool)
             .await?
         }
@@ -260,11 +258,10 @@ pub async fn get_recent(
                  n_draft_tokens, n_draft_accepted, captured_at \
                  FROM v_task_summary \
                  WHERE model_name = ? AND captured_at >= unixepoch('now', ?) \
-                 ORDER BY captured_at DESC LIMIT ?"
+                 ORDER BY captured_at DESC"
             )
             .bind(name)
             .bind(&format!("-{hours} hours"))
-            .bind(limit as i64)
             .fetch_all(pool)
             .await?
         }
@@ -276,10 +273,9 @@ pub async fn get_recent(
                  n_draft_tokens, n_draft_accepted, captured_at \
                  FROM v_task_summary \
                  WHERE captured_at > ? \
-                 ORDER BY captured_at DESC LIMIT ?"
+                 ORDER BY captured_at DESC"
             )
             .bind(s)
-            .bind(limit as i64)
             .fetch_all(pool)
             .await?
         }
@@ -291,10 +287,9 @@ pub async fn get_recent(
                  n_draft_tokens, n_draft_accepted, captured_at \
                  FROM v_task_summary \
                  WHERE captured_at >= unixepoch('now', ?) \
-                 ORDER BY captured_at DESC LIMIT ?"
+                 ORDER BY captured_at DESC"
             )
             .bind(&format!("-{hours} hours"))
-            .bind(limit as i64)
             .fetch_all(pool)
             .await?
         }

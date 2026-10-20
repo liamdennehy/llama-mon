@@ -42,6 +42,7 @@ button.active { background: var(--accent); color: #fff; border-color: var(--acce
 .chart-card h3 { font-size: 0.82rem; margin-bottom: 0.6rem; }
 canvas { max-height: 220px; width: 100% !important; }
 table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.inline-select { width: auto; font-size: 0.78rem; padding: 0.1rem 0.25rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-card); color: var(--text); margin: 0 0.25rem; }
 th, td { padding: 0.45rem 0.5rem; text-align: left; border-bottom: 1px solid var(--border); }
 th { color: var(--text-muted); font-weight: 600; position: sticky; top: 0; background: var(--bg-card); z-index: 1; }
 tr:hover td { background: var(--bg-hover); }
@@ -120,15 +121,23 @@ tr:hover td { background: var(--bg-hover); }
 <div class="card" style="margin-bottom:1rem;">
   <h3 style="margin-bottom:0.5rem;">Models</h3>
   <div class="scroll"><table><thead><tr>
-    <th>Name</th><th>Status</th><th>Created</th><th>Scrapes</th><th>Context Tokens</th><th>Model (V)RAM</th>
+    <th>Name</th><th>Status</th><th>Created</th><th>Scrapes</th><th>Context Tokens</th><th>MTP</th><th>Model (V)RAM</th>
   </tr></thead><tbody id="modelsBody"></tbody></table></div>
 </div>
 
 <div class="card">
-  <h3 style="margin-bottom:0.5rem;">Recent Tasks <span id="taskCount" style="font-weight:400;font-size:0.75rem;color:var(--text-muted);"></span></h3>
+  <h3 style="margin-bottom:0.5rem;">Recent Tasks
+    <select id="taskCountLimit" class="inline-select" aria-label="Show task count" title="Records to display">
+      <option value="10">10</option>
+      <option value="50">50</option>
+      <option value="200" selected>200</option>
+      <option value="1000">1000</option>
+    </select>
+    <span id="taskCount" style="font-weight:400;font-size:0.75rem;color:var(--text-muted);"></span>
+  </h3>
   <div class="scroll"><table><thead><tr>
     <th>ID</th><th>Model</th><th>Slot</th><th>Gen</th><th>Gen TPS</th>
-    <th>Gen ms/t</th><th>Prompt</th><th>Prompt TPS</th><th>KV Cache</th><th>Captured</th>
+    <th>Gen ms/t</th><th>Prompt (cache)</th><th>Prompt (new)</th><th>Prompt TPS</th><th>KV Cache</th><th>Captured</th>
   </tr></thead><tbody id="tasksBody"></tbody></table></div>
 </div>
 

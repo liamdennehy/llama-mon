@@ -65,9 +65,9 @@ async fn main() -> Result<()> {
     if config.should_scrub() {
         llama_mon::db::schema::init_db(&pool).await
             .with_context(|| format!("Failed to initialize database at {}", config.db_path.display()))?;
-        tracing::info!(db_path = %config.db_path.display(), "Database initialized");
+        eprintln!("Database initialized at {}", config.db_path.display());
     } else {
-        tracing::info!(db_path = %config.db_path.display(), "Database opened (reporter mode — no scraper)");
+        eprintln!("Database opened at {} (reporter mode)", config.db_path.display());
     }
 
     // Dedicated signal handler thread — sets atomic flags checked by the reactor.
@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     let signal_flag = SignalFlag::new();
     let _signal_thread = llama_mon::signals::spawn_handler(&signal_flag);
 
-    // Startup banner
+    // Startup banner — always visible (except in --silent mode)
     let active_servers: Vec<String> = config
         .active_servers()
         .iter()
@@ -85,16 +85,20 @@ async fn main() -> Result<()> {
         if config.should_scrub() { "scraper" } else { "no-scraper" },
         if config.should_serve_web() { "web" } else { "no-web" },
     ];
-    tracing::info!(
-        servers = ?active_servers,
-        poll_interval = ?config.poll_duration(),
-        timeout = ?config.timeout_duration(),
-        verbose = config.verbose,
-        model_filter = ?config.models,
-        fail_fast = config.fail_fast,
-        mode = %mode_parts.join("+"),
-        "llama-mon starting"
+    eprintln!(
+        "llama-mon v{} starting | servers={:?} mode={} poll={:?} timeout={:?}",
+        env!("CARGO_PKG_VERSION"),
+        active_servers,
+        mode_parts.join("+"),
+        config.poll_duration(),
+        config.timeout_duration()
     );
+    if !config.models.is_empty() {
+        eprintln!("  model filter: {:?}", config.models);
+    }
+    if config.fail_fast {
+        eprintln!("  fail-fast: enabled");
+    }
 
     // Spawn optional web server (shared across all servers)
     let web_handle = if config.should_serve_web() {
@@ -102,10 +106,9 @@ async fn main() -> Result<()> {
         let addr = format!("{}:{}", config.listen_ip, port).parse().unwrap();
         let shutdown_clone = shutdown_tx.clone();
         let h = tokio::spawn(llama_mon::web::serve(pool.clone(), addr, shutdown_clone));
-        tracing::info!(port, "Web dashboard enabled");
+        eprintln!("Web dashboard: {}:{}", config.listen_ip, port);
         Some(h)
     } else {
-        tracing::info!("Web server disabled (no --port)");
         None
     };
 
@@ -113,7 +116,7 @@ async fn main() -> Result<()> {
     let poll_handles: Vec<_> = if config.should_scrub() {
         let mut handles = Vec::new();
         for server in config.active_servers() {
-            tracing::info!(server = %server.identifier(), "Starting poller");
+            eprintln!("Poller: {}", server.identifier());
             let mut poller = llama_mon::poller::Poller::new(
                 server.clone(),
                 config.clone(),
@@ -126,11 +129,10 @@ async fn main() -> Result<()> {
             handles.push(h);
         }
         if handles.is_empty() {
-            tracing::warn!("No active servers configured — poller skipped");
+            eprintln!("No active servers configured — poller skipped");
         }
         handles
     } else {
-        tracing::info!("Scraper disabled (no --server)");
         Vec::new()
     };
 
@@ -191,19 +193,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Dump the current state of all model loads from the database as INFO log lines.
+/// Dump the current state of all model loads from the database.
 async fn dump_model_state(pool: &sqlx::SqlitePool) {
     match llama_mon::db::model_load::get_all(pool).await {
         Ok(rows) => {
             if rows.is_empty() {
-                tracing::info!("SIGUSR1: No model loads in database");
+                eprintln!("SIGUSR1: No model loads in database");
             } else {
-                tracing::info!(
-                    "SIGUSR1: Dumping {} model load(s)",
-                    rows.len()
-                );
+                eprintln!("SIGUSR1: Dumping {} model load(s)", rows.len());
                 for row in &rows {
-                    tracing::info!(
+                    eprintln!(
                         "MODEL: name={}, status={}, created={}, loaded_at={}, unloaded_at={}",
                         row.model_name,
                         row.status,
@@ -215,7 +214,7 @@ async fn dump_model_state(pool: &sqlx::SqlitePool) {
             }
         }
         Err(e) => {
-            tracing::error!(error = %e, "SIGUSR1: Failed to read model loads from database");
+            eprintln!("SIGUSR1: Failed to read model loads: {}", e);
         }
     }
 }

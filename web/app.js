@@ -3,6 +3,7 @@ const charts = {};
 let summary = null, models = [], scrapes = [], tasks = [];
 let autoRefresh = true;
 let fetchAll = false;
+let taskCountLimit = 200;
 let refreshTimer = null;
 // Track the most recent scrape/task timestamps for incremental updates
 let lastScrapeAt = 0, lastTaskAt = 0;
@@ -75,7 +76,7 @@ async function fetchData() {
   const model = document.getElementById('modelFilter').value;
   // Map frontend values (1h, 6h, 24h, 7d) to Rust enum variants (H1, H6, H24, D7)
   const rangeMap = { '1h': 'H1', '6h': 'H6', '24h': 'H24', '7d': 'D7' };
-  const params = new URLSearchParams({ time_range: rangeMap[range] || 'H24', limit: 200 });
+  const params = new URLSearchParams({ time_range: rangeMap[range] || 'H24' });
   if (model) params.set('model', model);
   // Only use 'since' on non-initial, non-full-refreshes
   if (lastScrapeAt > 0 && !fetchAll) {
@@ -134,25 +135,28 @@ function render() {
   const filterModel = document.getElementById('modelFilter').value;
   const filteredModels = filterModel ? models.filter(m => m.model_name === filterModel) : models;
   mb.innerHTML = filteredModels.map(m => {
-    const ctxVram = m.cache_ram || 0;
-    const modelVram = m.model_bytes || 0;
-    const totalVram = ctxVram + modelVram;
+    const modelVram = m.memory_model_bytes || 0;
     return `<tr><td>${esc(m.model_name)}</td>` +
     `<td class="${m.status==='loaded'?'status-loaded':'status-unloaded'}">${m.status}</td>` +
     `<td>${new Date(m.created*1000).toLocaleString()}</td>` +
     `<td>${m.scrape_count ?? '—'}</td>` +
     `<td>${m.ctx_size ? m.ctx_size.toLocaleString() : '—'}</td>` +
-    `<td>${formatBytes(totalVram)}</td></tr>`;
+    `<td>${m.mtp ? 'Yes' : '—'}</td>` +
+    `<td>${formatBytes(modelVram)}</td></tr>`;
   }).join('');
 
   const tb = document.getElementById('tasksBody');
   document.getElementById('taskCount').textContent = `(${tasks.length} shown)`;
-  tb.innerHTML = tasks.slice(0, 50).map(t => {
-    const totalPrompt = t.n_prompt_cached + t.n_prompt_processed;
-    const kvCache = totalPrompt > 0 ? ((t.n_prompt_cached / totalPrompt) * 100).toFixed(1) + '%' : '—';
+  tb.innerHTML = tasks.slice(0, taskCountLimit).map(t => {
+    const cached = t.n_prompt_cached || 0;
+    const newTokens = t.n_prompt_processed || 0;
+    const totalPrompt = cached + newTokens;
+    const kvCache = totalPrompt > 0 ? ((cached / totalPrompt) * 100).toFixed(1) + '%' : '—';
     return `<tr><td>${t.task_id}</td><td>${esc(t.model_name)}</td><td>${t.slot_id}</td>` +
     `<td>${t.n_gen}</td><td>${t.gen_tps.toFixed(1)}</td>` +
-    `<td>${t.gen_per_token_ms.toFixed(1)}</td><td>${totalPrompt}</td>` +
+    `<td>${t.gen_per_token_ms.toFixed(1)}</td>` +
+    `<td>${cached.toLocaleString()}</td>` +
+    `<td>${newTokens.toLocaleString()}</td>` +
     `<td>${t.prompt_tps.toFixed(1)}</td>` +
     `<td>${kvCache}</td>` +
     `<td>${new Date(t.captured_at*1000).toLocaleString()}</td></tr>`;
@@ -285,15 +289,19 @@ function renderCharts() {
 function renderBubbleChart(gridColor, tickColor) {
   const metric = document.getElementById('tpsMetric')?.value || 'gen_tps';
   const limit = 500;
+  const isGen = metric === 'gen_tps';
   const data = tasks.slice(0, limit).map(t => {
     const ctxLen = (t.n_prompt_cached || 0) + (t.n_prompt_processed || 0);
     const tps = t[metric] || 0;
-    const r = ctxLen > 0 ? Math.max(3, Math.min(20, Math.sqrt(t.n_gen || 1) * 0.7)) : 0;
+    // Use the relevant token count for bubble size
+    const tokenCount = isGen ? (t.n_gen || 0) : ((t.n_prompt_cached || 0) + (t.n_prompt_processed || 0));
+    const r = tokenCount > 0 ? Math.max(3, Math.min(20, Math.sqrt(tokenCount) * 0.7)) : 0;
     return { x: ctxLen, y: tps, r };
   }).filter(d => d.x > 0 && d.r > 0);
 
-  const yLabel = metric === 'gen_tps' ? 'Gen TPS' : 'Prompt TPS';
-  const color = metric === 'gen_tps' ? '#3fb950' : '#58a6ff';
+  const yLabel = isGen ? 'Gen TPS' : 'Prompt TPS';
+  const tokenLabel = isGen ? 'Gen' : 'Prompt';
+  const color = isGen ? '#3fb950' : '#58a6ff';
 
   if (charts.chartBubble) charts.chartBubble.destroy();
   charts.chartBubble = new Chart(document.getElementById('chartBubble'), {
@@ -309,16 +317,48 @@ function renderBubbleChart(gridColor, tickColor) {
     },
     options: {
       responsive: true,
+      layout: { padding: { right: 70 } },
       plugins: {
         legend: { display: false },
         tooltip: {
           callbacks: {
             label: function(ctx) {
               const d = ctx.raw;
-              return `${yLabel}: ${d.y.toFixed(1)}  Tokens: ${Math.round(d.r*d.r/0.49)}`;
+              const tokens = Math.round(d.r * d.r / 0.49);
+              return `${yLabel}: ${d.y.toFixed(1)}  ${tokenLabel} tokens: ${tokens}`;
             }
           }
-        }
+        },
+        // Custom plugin: draw bubble size legend on the right side
+        _bubbleLegend: {
+          beforeDraw: function(chart) {
+            const ctx = chart.ctx;
+            const area = chart.chartArea;
+            if (!area) return;
+            const { top, right, bottom } = area;
+            const x = right + 10;
+            ctx.save();
+            ctx.fillStyle = tickColor;
+            ctx.font = '11px sans-serif';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'middle';
+            const step = Math.max(20, (bottom - top) / (legendSizes.length + 1));
+            legendSizes.forEach((count, i) => {
+              const cy = top + (i + 1) * step;
+              const radius = count > 0 ? Math.max(3, Math.min(20, Math.sqrt(count) * 0.7)) : 0;
+              ctx.beginPath();
+              ctx.arc(x, cy, radius, 0, Math.PI * 2);
+              ctx.fillStyle = color + '99';
+              ctx.fill();
+              ctx.strokeStyle = color;
+              ctx.lineWidth = 1;
+              ctx.stroke();
+              ctx.fillStyle = tickColor;
+              ctx.fillText(count + ' tokens', x + radius + 6, cy);
+            });
+            ctx.restore();
+          }
+        },
       },
       scales: {
         x: {
@@ -388,6 +428,11 @@ document.getElementById('modelFilter').addEventListener('change', () => {
   fetchData();
 });
 document.getElementById('tpsMetric')?.addEventListener('change', () => requestAnimationFrame(() => renderCharts()));
+
+document.getElementById('taskCountLimit').addEventListener('change', (e) => {
+  taskCountLimit = parseInt(e.target.value, 10);
+  render();
+});
 
 // ── Init ─────────────────────────────────────────────────────
 async function initModelFilter() {
