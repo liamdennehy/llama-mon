@@ -93,6 +93,10 @@ async fn main() -> Result<()> {
         config.poll_duration(),
         config.timeout_duration()
     );
+    // Emit config source tracking
+    for (key, source) in &config.sources {
+        eprintln!("  {} <- {}", key, source);
+    }
     if !config.models.is_empty() {
         eprintln!("  model filter: {:?}", config.models);
     }

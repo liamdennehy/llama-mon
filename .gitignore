@@ -1,1 +1,4 @@
 /target
+/local
+.env
+web/chart.umd.min.js

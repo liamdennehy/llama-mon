@@ -38,6 +38,21 @@ pub async fn serve_dashboard() -> axum::response::Response {
     }
 }
 
+/// Serve the embedded Chart.js UMD bundle.
+pub async fn serve_chart_js() -> axum::response::Response {
+    #[cfg(not(feature = "dev"))]
+    {
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+            .body(axum::body::Body::from(CHART_JS.to_vec()))
+            .unwrap()
+    }
+    #[cfg(feature = "dev")]
+    {
+        serve_file("chart.umd.min.js").await
+    }
+}
+
 /// Serve the application JavaScript bundle.
 pub async fn serve_app_js() -> axum::response::Response {
     #[cfg(not(feature = "dev"))]
@@ -60,6 +75,15 @@ pub const DASHBOARD_HTML: &[u8] = include_bytes!("../../web/index.html");
 #[cfg(not(feature = "dev"))]
 /// The embedded application JavaScript.
 pub const APP_JS: &[u8] = include_bytes!("../../web/app.js");
+
+#[cfg(not(feature = "dev"))]
+/// Chart.js 4.x UMD bundle.
+///
+/// Licensed under the MIT License:
+///   Copyright (c) 2014-2024 Chart.js Contributors
+///   https://github.com/chartjs/Chart.js
+///   Downloaded at build time via build.rs
+pub const CHART_JS: &[u8] = include_bytes!("../../web/chart.umd.min.js");
 
 /// Serve a file from the `web/` directory.
 #[cfg(feature = "dev")]

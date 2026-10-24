@@ -50,7 +50,9 @@ llama-mon is a Rust 2024 async daemon that polls a llama.cpp inference server's 
 ## Web Dashboard
 
 - Dashboard is a single file: `web/index.html` — no build step, no framework
-- Static files are embedded in the binary via `include_bytes!` in `web/static_files.rs`
+- All frontend assets (HTML, JS, CSS, fonts, etc.) are embedded in the binary via `include_bytes!` in `web/static_files.rs` — **no external CDN dependencies**. Every new `<script src>`, `<link href>`, `<img src>`, or external resource added to the dashboard must be bundled and served via a route in `static_files.rs`.
+- Add a dedicated route in `src/web/mod.rs` for each embedded asset.
+- Update `AGENTS.md` Web Dashboard section when adding new static resources.
 - API endpoints are split: `/api/stats/summary`, `/api/models`, `/api/scrapes`, `/api/tasks`
 - All 3 data endpoints share query params: `limit`, `model`, `time_range`
 - Frontend fetches all endpoints in parallel via `Promise.all`

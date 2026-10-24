@@ -3,10 +3,11 @@
 //! Parsed from `.env` file, CLI arguments, and environment variables.
 //! Includes validation and multi-server support.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser, parser::ValueSource};
 use thiserror::Error;
 
 /// A single monitored server (URL + active flag).
@@ -142,6 +143,10 @@ pub struct Config {
     /// is disabled. Set to `0` to disable explicitly.
     #[arg(long = "listen-port", env = "LLAMA_MON_WEB_PORT")]
     pub web_port: Option<u16>,
+
+    /// Track where each config value came from (populated by `load()`).
+    #[arg(skip)]
+    pub sources: HashMap<String, String>,
 }
 
 #[derive(Error, Debug)]
@@ -165,27 +170,116 @@ impl Config {
         // Load .env file silently — failures are non-fatal
         let _ = dotenvy::dotenv();
 
+        // Use ArgMatches to detect which CLI flags were explicitly provided
+        let matches = Self::command().get_matches();
+
+        let cli_has_servers = matches.value_source("server_urls")
+            .map(|s| s == ValueSource::CommandLine).unwrap_or(false);
+        let cli_has_port = matches.value_source("web_port")
+            .map(|s| s == ValueSource::CommandLine).unwrap_or(false);
+        let cli_has_verbose = matches.value_source("verbose")
+            .map(|s| s == ValueSource::CommandLine).unwrap_or(false);
+        let cli_has_quiet = matches.value_source("quiet")
+            .map(|s| s == ValueSource::CommandLine).unwrap_or(false);
+        let cli_has_debug = matches.value_source("debug")
+            .map(|s| s == ValueSource::CommandLine).unwrap_or(false);
+        let cli_has_silent = matches.value_source("silent")
+            .map(|s| s == ValueSource::CommandLine).unwrap_or(false);
+        let cli_has_fail_fast = matches.value_source("fail_fast")
+            .map(|s| s == ValueSource::CommandLine).unwrap_or(false);
+        let cli_has_models = matches.value_source("models")
+            .map(|s| s == ValueSource::CommandLine).unwrap_or(false);
+
         let config = Self::parse();
 
         // Parse raw URL strings into ServerConfig structs.
         // Backwards compat: if no --server flags were given, use the
         // LLAMA_MON_SERVER_URL env var as a default single server.
-        let urls = if config.server_urls.is_empty() {
+        let server_source = if cli_has_servers {
+            "CLI (--server)".to_string()
+        } else if std::env::var("LLAMA_MON_SERVER_URL").is_ok() {
+            "env (LLAMA_MON_SERVER_URL)".to_string()
+        } else {
+            "default (localhost:8080)".to_string()
+        };
+
+        let servers = if config.server_urls.is_empty() {
             vec![std::env::var("LLAMA_MON_SERVER_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".to_string())]
         } else {
             config.server_urls.clone()
         };
 
-        let servers = urls
+        let servers_parsed = servers
             .into_iter()
             .map(|u| ServerConfig::from_host_port(&u, true))
             .collect::<Result<Vec<_>, _>>()
             .expect("invalid server URL in config");
 
+        // Build source map
+        let mut sources = HashMap::new();
+        sources.insert("server".to_string(), server_source);
+
+        if config.web_port.is_some() {
+            let port_source = if cli_has_port {
+                "CLI (--port)".to_string()
+            } else if std::env::var("LLAMA_MON_WEB_PORT").is_ok() {
+                "env (LLAMA_MON_WEB_PORT)".to_string()
+            } else {
+                "default (disabled)".to_string()
+            };
+            sources.insert("port".to_string(), port_source);
+        }
+
+        let verbosity_source = if cli_has_silent {
+            "CLI (--silent)".to_string()
+        } else if cli_has_quiet {
+            "CLI (--quiet)".to_string()
+        } else if cli_has_verbose {
+            "CLI (--verbose)".to_string()
+        } else if cli_has_debug {
+            "CLI (--debug)".to_string()
+        } else if std::env::var("RUST_LOG").is_ok() {
+            "env (RUST_LOG)".to_string()
+        } else {
+            "default (warn)".to_string()
+        };
+        sources.insert("verbosity".to_string(), verbosity_source);
+
+        if !config.models.is_empty() {
+            let model_source = if cli_has_models {
+                "CLI (--model)".to_string()
+            } else if std::env::var("LLAMA_MON_MODEL").is_ok() {
+                "env (LLAMA_MON_MODEL)".to_string()
+            } else {
+                "default (all models)".to_string()
+            };
+            sources.insert("models".to_string(), model_source);
+        }
+
+        if cli_has_fail_fast {
+            sources.insert("fail-fast".to_string(), "CLI (--fail-fast)".to_string());
+        }
+
+        if std::env::var("LLAMA_MON_LISTEN_IP").is_ok() {
+            sources.insert("listen_ip".to_string(), "env (LLAMA_MON_LISTEN_IP)".to_string());
+        }
+
+        if std::env::var("LLAMA_MON_POLL_INTERVAL").is_ok() {
+            sources.insert("poll_interval".to_string(), "env (LLAMA_MON_POLL_INTERVAL)".to_string());
+        }
+
+        if std::env::var("LLAMA_MON_DB_PATH").is_ok() {
+            sources.insert("db_path".to_string(), "env (LLAMA_MON_DB_PATH)".to_string());
+        }
+
+        if std::env::var("LLAMA_MON_TIMEOUT").is_ok() {
+            sources.insert("timeout".to_string(), "env (LLAMA_MON_TIMEOUT)".to_string());
+        }
+
         Self {
             server_urls: config.server_urls,
-            servers,
+            servers: servers_parsed,
             poll_interval: config.poll_interval,
             db_path: config.db_path,
             timeout: config.timeout,
@@ -197,6 +291,7 @@ impl Config {
             fail_fast: config.fail_fast,
             listen_ip: config.listen_ip,
             web_port: config.web_port,
+            sources,
         }
     }
 
@@ -328,6 +423,7 @@ mod tests {
             fail_fast: false,
             listen_ip: "127.0.0.1".to_string(),
             web_port: Some(8081),
+            sources: HashMap::new(),
         }
     }
 
@@ -347,6 +443,7 @@ mod tests {
             fail_fast: false,
             listen_ip: "127.0.0.1".to_string(),
             web_port: None,
+            sources: HashMap::new(),
         }
     }
 
